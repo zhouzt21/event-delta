@@ -1,117 +1,168 @@
 import json
-import tempfile
-import unittest
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from tools.audit_sevd import audit_recording, build_manifest_rows, create_visualization
+from tools.audit_sevd import LIMIT, audit_recording, classify, main, manifest_candidates
 
 
-class AuditSevdTest(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.recording = self.root / "extracted" / "fixed-3-archive"
-        for name in ("rgb", "event", "flow", "annotation", "semantic", "instance"):
-            (self.recording / name).mkdir(parents=True, exist_ok=True)
-        (self.recording / "metadata.json").write_text(
-            json.dumps({"timestamp_unit": "microseconds", "source": "synthetic-test"}), encoding="utf-8"
-        )
-
-    def tearDown(self):
-        self.temporary.cleanup()
-
-    def add_frame(self, identifier: int, timestamps=None):
-        stem = f"frame_{identifier:06d}"
-        image = Image.new("RGB", (8, 6), (10, 20, 30))
-        image.save(self.recording / "rgb" / f"{stem}.png")
-        image.save(self.recording / "event" / f"{stem}_preview.png")
-        image.save(self.recording / "semantic" / f"{stem}.png")
-        image.save(self.recording / "instance" / f"{stem}.png")
-        t = np.asarray(timestamps if timestamps is not None else [identifier * 10, identifier * 10 + 1])
-        np.savez(
-            self.recording / "event" / f"{stem}.npz",
-            x=np.array([1, 2]),
-            y=np.array([2, 3]),
-            p=np.array([0, 1]),
-            t=t,
-        )
-        np.savez(self.recording / "flow" / f"{stem}.npz", flow=np.zeros((6, 8, 2), dtype=np.float32))
-        annotation = {
-            "objects": [
-                {
-                    "class_id": 2,
-                    "object_id": 99,
-                    "bbox": {"x_min": 1, "y_min": 1, "x_max": 5, "y_max": 4},
-                }
-            ]
-        }
-        (self.recording / "annotation" / f"{stem}.json").write_text(json.dumps(annotation), encoding="utf-8")
-
-    def audit(self):
-        report, _mapping, _recording_root = audit_recording(self.root, "fixed-3")
-        return report
-
-    def test_normal_pairing(self):
-        for identifier in range(1, 4):
-            self.add_frame(identifier)
-        report = self.audit()
-        self.assertEqual(report["frame_id_alignment"]["intersection"], [1, 2, 3])
-        self.assertEqual(report["file_counts"]["rgb"], 3)
-        self.assertFalse(report["frame_id_alignment"]["duplicates_by_modality"]["rgb"])
-        sample = report["annotation_samples"][0]
-        self.assertEqual(sample["class_id_fields"], ["class_id"])
-        self.assertEqual(sample["object_id_fields"], ["object_id"])
-        self.assertIn("bbox", sample["bbox_fields"])
-
-    def test_missing_one_rgb_frame(self):
-        self.add_frame(1)
-        self.add_frame(2)
-        (self.recording / "rgb" / "frame_000002.png").unlink()
-        report = self.audit()
-        self.assertEqual(report["frame_id_alignment"]["missing_by_modality"]["rgb"], [2])
-        self.assertEqual(report["frame_id_alignment"]["intersection"], [1])
-
-    def test_non_monotonic_event_timestamp(self):
-        self.add_frame(1, timestamps=[10, 9, 11])
-        report = self.audit()
-        codes = {item["code"] for item in report["warnings"]}
-        self.assertIn("non_monotonic_event_timestamp", codes)
-        self.assertFalse(report["event_npz_samples"][0]["timestamp_monotonic_nondecreasing"])
-
-    def test_unknown_npz_fields(self):
-        self.add_frame(1)
-        path = self.recording / "event" / "frame_000001.npz"
-        np.savez(path, unknown=np.array([1, 2, 3]))
-        report = self.audit()
-        codes = {item["code"] for item in report["warnings"]}
-        self.assertIn("unknown_event_npz_fields", codes)
-        self.assertIsNone(report["event_npz_samples"][0]["recognized_key_mapping"])
-
-    def test_duplicate_frame_id(self):
-        self.add_frame(1)
-        image = Image.new("RGB", (8, 6))
-        image.save(self.recording / "rgb" / "rgb_copy_000001.png")
-        report = self.audit()
-        duplicates = report["frame_id_alignment"]["duplicates_by_modality"]["rgb"]
-        self.assertIn("1", duplicates)
-        self.assertIn("duplicate_frame_id", {item["code"] for item in report["warnings"]})
-
-    def test_twenty_row_manifest_and_visualization(self):
-        for identifier in range(1, 21):
-            self.add_frame(identifier)
-        report, mapping, _recording_root = audit_recording(self.root, "fixed-3")
-        self.assertTrue(report["mapping_preview_eligible"])
-        rows = build_manifest_rows("fixed-3", mapping, self.root)
-        self.assertEqual(len(rows), 20)
-        self.assertTrue(all(not Path(row["rgb_path"]).is_absolute() for row in rows))
-        destination = self.root / "alignment.png"
-        created, reason = create_visualization(rows, self.root, destination)
-        self.assertTrue(created, reason)
-        self.assertTrue(destination.is_file())
+EVENT_DTYPE = np.dtype([("x", "<u2"), ("y", "<u2"), ("t", "<i8"), ("pol", "?")])
 
 
-if __name__ == "__main__":
-    unittest.main()
+def write_kitti(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("truck 0.0 0 0.1 1 1 6 5 1 2 3 4 5 6 0.2 99\n", encoding="utf-8")
+
+
+def add_frame(recording: Path, identifier: int, timestamps: list[int] | None = None) -> None:
+    rgb = Image.new("RGB", (8, 6), (10, 20, 30))
+    rgb.save(recording / "rgb_camera" / f"{identifier}.png")
+    rgb.save(recording / "dvs_camera" / f"{identifier}.png")
+    rgb.save(recording / "optical_flow_camera" / f"{identifier}.png")
+    rgb.save(recording / "depth_camera" / f"{identifier:05d}.png")
+    rgb.save(recording / "semantic_segmentation_camera" / f"{identifier:05d}.png")
+    rgb.save(recording / "instance_segmentation_camera" / f"{identifier:05d}.png")
+    times = timestamps or [identifier * 100_000, identifier * 100_000 + 10]
+    events = np.zeros(len(times), dtype=EVENT_DTYPE)
+    events["x"] = np.arange(len(times)) + 1
+    events["y"] = np.arange(len(times)) + 2
+    events["t"] = times
+    events["pol"] = np.arange(len(times)) % 2 == 0
+    np.savez(recording / "dvs_camera" / f"{identifier}-xytp.npz", dvs_events=events)
+    np.savez(recording / "optical_flow_camera" / f"{identifier}.npz",
+             flow=np.ones((6, 8, 2), dtype=np.float32))
+    write_kitti(recording / "annotations" / "rgb_camera" / "KITTI" / f"{identifier}.txt")
+    write_kitti(recording / "annotations" / "dvs_camera" / "KITTI" / f"{identifier}.txt")
+    voc = recording / "annotations" / "rgb_camera" / "VOC" / f"{identifier}.xml"
+    voc.parent.mkdir(parents=True, exist_ok=True)
+    voc.write_text("<annotation/>", encoding="utf-8")
+    coco = recording / "annotations" / "dvs_camera" / "COCO" / f"{identifier}.json"
+    coco.parent.mkdir(parents=True, exist_ok=True)
+    coco.write_text("{}", encoding="utf-8")
+
+
+def make_dataset(tmp_path: Path, frame_count: int = 3) -> tuple[Path, Path, Path]:
+    root = tmp_path / "SEVD"
+    recording = root / "extracted" / "fixed-3-archive"
+    for directory in ("rgb_camera", "dvs_camera", "optical_flow_camera", "depth_camera",
+                      "semantic_segmentation_camera", "instance_segmentation_camera"):
+        (recording / directory).mkdir(parents=True, exist_ok=True)
+    for identifier in range(4591, 4591 + frame_count):
+        add_frame(recording, identifier)
+    metadata = tmp_path / "explicit-metadata.json"
+    metadata.write_text(json.dumps({"duration": 1800, "delta_seconds": 0.1,
+                                    "egos": 0, "fixed-views": 4}), encoding="utf-8")
+    return root, recording, metadata
+
+
+def test_recording_relative_classification_prioritizes_annotations(tmp_path):
+    root, recording, _metadata = make_dataset(tmp_path, 1)
+    annotation = recording / "annotations" / "rgb_camera" / "KITTI" / "4591.txt"
+    assert classify(annotation, recording) == "annotation"
+    report, _state = audit_recording(root, "fixed-3")
+    assert report["file_counts"]["rgb_frame"] == 1
+    assert report["file_counts"]["annotation"] == 4
+
+
+def test_structured_event_and_previews_are_not_duplicates(tmp_path):
+    root, _recording, metadata = make_dataset(tmp_path, 3)
+    report, _state = audit_recording(root, "fixed-3", metadata)
+    assert report["file_counts"]["event_npz"] == 3
+    assert report["file_counts"]["event_preview"] == 3
+    assert report["file_counts"]["flow_preview"] == 3
+    assert report["frame_id_alignment"]["modalities"]["event_npz"]["duplicate_count"] == 0
+    sample = report["event_audit"]["samples"][0]
+    assert sample["schema_kind"] == "structured_dvs_events"
+    assert sample["event_count"] == 2
+    assert sample["timestamp_monotonic_nondecreasing"] is True
+    assert sample["positive_polarity_count"] == 1
+    assert sample["negative_polarity_count"] == 1
+
+
+def test_annotation_encodings_are_separate_from_canonical_duplicates(tmp_path):
+    root, _recording, metadata = make_dataset(tmp_path, 2)
+    report, _state = audit_recording(root, "fixed-3", metadata)
+    counts = report["annotations"]["counts"]
+    assert counts["rgb_KITTI"] == 2
+    assert counts["dvs_KITTI"] == 2
+    assert counts["rgb_VOC"] == 2
+    assert counts["COCO"] == 2
+    assert report["annotations"]["alignment_bbox_source"] == "rgb_camera/KITTI"
+    assert all(item["duplicate_count"] == 0
+               for item in report["frame_id_alignment"]["modalities"].values())
+
+
+def test_dvs_kitti_fallback_is_reported(tmp_path):
+    root, recording, metadata = make_dataset(tmp_path, 3)
+    for path in (recording / "annotations" / "rgb_camera" / "KITTI").glob("*.txt"):
+        path.unlink()
+    report, state = audit_recording(root, "fixed-3", metadata)
+    assert report["annotations"]["alignment_bbox_source"] == "dvs_camera/KITTI"
+    assert report["annotations"]["alignment_bbox_fallback_used"] is True
+    assert "dvs_kitti_bbox_fallback" in {item["code"] for item in report["warnings"]}
+    assert manifest_candidates(state, root)[0]["rgb_annotation_path"] is None
+
+
+def test_structured_event_non_monotonic_warning(tmp_path):
+    root, recording, metadata = make_dataset(tmp_path, 1)
+    add_frame(recording, 4591, [10, 9, 11])
+    report, _state = audit_recording(root, "fixed-3", metadata)
+    assert report["event_audit"]["non_monotonic_count"] == 1
+    assert "non_monotonic_event_timestamp" in {item["code"] for item in report["warnings"]}
+
+
+def test_explicit_metadata_path_and_timestamp_inference(tmp_path):
+    root, _recording, metadata = make_dataset(tmp_path, 3)
+    report, _state = audit_recording(root, "fixed-3", metadata)
+    assert report["metadata"]["values"] == {"delta_seconds": 0.1, "duration": 1800,
+                                               "egos": 0, "fixed-views": 4}
+    assert report["event_audit"]["timestamp_unit"]["status"] == "inference"
+
+
+def test_metadata_falls_back_to_recording_parent(tmp_path):
+    root, recording, metadata = make_dataset(tmp_path, 2)
+    parent_metadata = recording.parent / "metadata.json"
+    parent_metadata.write_text(metadata.read_text(encoding="utf-8"), encoding="utf-8")
+    report, _state = audit_recording(root, "fixed-3")
+    assert report["metadata"]["path"] == "extracted/metadata.json"
+    assert report["metadata"]["values"]["delta_seconds"] == 0.1
+
+
+def test_manifest_and_alignment_preview_are_generated(tmp_path):
+    root, _recording, metadata = make_dataset(tmp_path, 21)
+    output = tmp_path / "artifacts" / "r1" / "audit.json"
+    result = main(["--root", str(root), "--recording", "fixed-3",
+                   "--metadata-path", str(metadata), "--output", str(output)])
+    assert result == 0
+    audit = json.loads(output.read_text(encoding="utf-8"))
+    assert audit["recordings"][0]["mapping_confirmed"] is True
+    assert audit["recordings"][0]["mapping_checks"] == {
+        "canonical_directories_identified": True,
+        "event_npz_schema_parseable": True,
+        "sampled_flow_npz_schema_parseable": True,
+        "canonical_frame_intersection_nonempty": True,
+    }
+    assert audit["recordings"][0]["alignment_preview_frame_ids"] == [4591, 4601, 4611]
+    manifest = output.parent / "manifest_preview.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == LIMIT
+    assert set(rows[0]) >= {"recording", "frame_id", "rgb_path", "event_npz_path",
+                            "flow_npz_path", "rgb_annotation_path"}
+    assert all(not Path(row["rgb_path"]).is_absolute() for row in rows)
+    assert (output.parent / "alignment_preview_fixed-3.png").is_file()
+
+
+def test_missing_and_duplicate_examples_are_capped(tmp_path):
+    root, recording, metadata = make_dataset(tmp_path, 25)
+    for identifier in range(4591, 4616):
+        (recording / "rgb_camera" / f"{identifier}.png").unlink()
+        np.savez(recording / "optical_flow_camera" / f"copy-{identifier}.npz",
+                 flow=np.ones((6, 8, 2), dtype=np.float32))
+    report, _state = audit_recording(root, "fixed-3", metadata)
+    rgb = report["frame_id_alignment"]["modalities"]["rgb_frame"]
+    flow = report["frame_id_alignment"]["modalities"]["flow_npz"]
+    assert rgb["missing_count"] == 25
+    assert len(rgb["missing_examples"]) == LIMIT
+    assert flow["duplicate_count"] == 25
+    assert len(flow["duplicate_examples"]) == LIMIT
