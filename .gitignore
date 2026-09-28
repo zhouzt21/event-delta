@@ -25,6 +25,7 @@ __pycache__/
 .ruff_cache/
 
 # Experiment outputs
+artifacts/
 outputs/
 results/
 runs/
