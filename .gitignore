@@ -1,0 +1,47 @@
+# Data
+data/
+datasets/
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# Model weights
+weights/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Experiment outputs
+outputs/
+results/
+runs/
+logs/
+wandb/
+tensorboard/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
