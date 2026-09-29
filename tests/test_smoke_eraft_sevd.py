@@ -6,8 +6,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import tools.smoke_eraft_sevd as smoke
 from tools.smoke_eraft_sevd import (
     checkpoint_prefix_action,
+    load_model,
     normalize_state_dict_prefix,
     prediction_statistics,
     read_sevd_events,
@@ -144,6 +146,60 @@ def test_prefix_normalization_accepts_only_exact_or_uniform_module_prefix():
         normalize_state_dict_prefix({"module.a": 1, "b": 2}, {"a", "b"})
     with pytest.raises(ValueError, match="strictly match"):
         normalize_state_dict_prefix({"wrong": 1}, {"a", "b"})
+
+
+def test_legacy_checkpoint_load_is_explicit_and_state_dict_remains_strict(tmp_path, monkeypatch, capsys):
+    eraft_root = tmp_path / "E-RAFT"
+    (eraft_root / "model").mkdir(parents=True)
+    checkpoint = tmp_path / "dsec.tar"
+    checkpoint.write_bytes(b"trusted-official-checkpoint-test")
+
+    class FakeModel:
+        def __init__(self):
+            self.loaded = None
+
+        def state_dict(self):
+            return {"weight": object()}
+
+        def load_state_dict(self, state, strict):
+            self.loaded = {"state": state, "strict": strict}
+
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return self
+
+    model = FakeModel()
+
+    class FakeModule:
+        __file__ = str(eraft_root / "model" / "eraft.py")
+
+        @staticmethod
+        def ERAFT(config, n_first_channels):
+            assert config == {"subtype": "standard"}
+            assert n_first_channels == 15
+            return model
+
+    class FakeTorch:
+        calls = []
+
+        @classmethod
+        def load(cls, *args, **kwargs):
+            cls.calls.append((args, kwargs))
+            return {"model": {"weight": object()}}
+
+    monkeypatch.setattr(smoke, "git_head", lambda _root: smoke.ERAFT_COMMIT)
+    monkeypatch.setattr(smoke.importlib, "import_module", lambda name: FakeModule)
+    loaded, metadata = load_model(FakeTorch, eraft_root, checkpoint, 15, "standard", object())
+    assert loaded is model
+    assert FakeTorch.calls == [((str(checkpoint),), {"map_location": "cpu", "weights_only": False})]
+    assert model.loaded["strict"] is True
+    assert metadata["strict_load"] is True
+    assert metadata["torch_load_weights_only"] is False
+    assert metadata["checkpoint_trusted_source_required"] is True
+    assert metadata["checkpoint_size_bytes"] == checkpoint.stat().st_size
+    assert "Loading trusted legacy E-RAFT checkpoint with weights_only=False" in capsys.readouterr().out
 
 
 def test_shape_and_finite_guard():

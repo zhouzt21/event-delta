@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib
 import os
+import pickle
 import platform
 import subprocess
 import sys
@@ -435,6 +436,19 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def checkpoint_file_metadata(checkpoint_path: Path) -> dict[str, Any]:
+    path = checkpoint_path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint must be an existing ordinary file: {path}")
+    return {
+        "checkpoint_path": str(path),
+        "checkpoint_size_bytes": path.stat().st_size,
+        "checkpoint_sha256": sha256_file(path),
+        "torch_load_weights_only": False,
+        "checkpoint_trusted_source_required": True,
+    }
+
+
 def git_head(root: Path) -> str:
     process = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True,
                              capture_output=True, check=False)
@@ -466,6 +480,7 @@ def numpy_compatibility_error(exc: BaseException) -> RuntimeError | None:
 
 def load_model(torch: Any, eraft_root: Path, checkpoint_path: Path, bins: int,
                mode: str, device: Any) -> tuple[Any, dict[str, Any]]:
+    checkpoint_metadata = checkpoint_file_metadata(checkpoint_path)
     revision = git_head(eraft_root)
     if revision != ERAFT_COMMIT:
         raise RuntimeError(f"E-RAFT HEAD mismatch: expected {ERAFT_COMMIT}, got {revision}")
@@ -482,7 +497,12 @@ def load_model(torch: Any, eraft_root: Path, checkpoint_path: Path, bins: int,
     if eraft_root not in module_path.parents:
         raise ImportError(f"resolved model.eraft outside --eraft-root: {module_path}")
     model = module.ERAFT(config={"subtype": mode}, n_first_channels=bins)
-    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    print("Loading trusted legacy E-RAFT checkpoint with weights_only=False", flush=True)
+    checkpoint = torch.load(
+        str(checkpoint_path),
+        map_location="cpu",
+        weights_only=False,
+    )
     if not isinstance(checkpoint, Mapping) or "model" not in checkpoint:
         raise ValueError("checkpoint must be a mapping containing key 'model'")
     state = checkpoint["model"]
@@ -493,6 +513,7 @@ def load_model(torch: Any, eraft_root: Path, checkpoint_path: Path, bins: int,
     normalized = normalize_state_dict_prefix(state, expected_keys)
     model.load_state_dict(normalized, strict=True)
     metadata = {
+        **checkpoint_metadata,
         "strict_load": True,
         "state_dict_key_count": len(state),
         "module_prefix_action": prefix_action,
@@ -629,6 +650,12 @@ def write_summary(path: Path, config: dict[str, Any], metrics: dict[str, Any]) -
         f"- Endpoint cosine: {positive['endpoint_cosine']}",
         f"- Predicted/GT magnitude ratio: {positive['predicted_to_gt_magnitude_ratio']}",
         f"- Block reasons: {decision['reasons'] or 'none'}",
+        f"- Checkpoint path: `{config['checkpoint_path']}`",
+        f"- Checkpoint size: {config['checkpoint_size_bytes']} bytes",
+        f"- Checkpoint SHA-256: `{config['checkpoint_sha256']}`",
+        f"- torch.load weights_only: `{str(config['torch_load_weights_only']).lower()}`",
+        f"- Trusted official-source checkpoint required: "
+        f"`{str(config['checkpoint_trusted_source_required']).lower()}`",
         "",
         "Negative-sign and swapped-event results are diagnostics only and never replace the formal output.",
         "GT flow is oracle evaluation data and is not an E-RAFT input.",
@@ -665,6 +692,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --root/--eraft-root must be directories and --checkpoint must be a file", file=sys.stderr)
         return 2
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_metadata = checkpoint_file_metadata(checkpoint)
     config: dict[str, Any] = {
         "status": "starting",
         "scope": "R3a E-RAFT flow-only single-transition smoke",
@@ -676,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
         "gt_flow_frame_id": args.source_frame_id,
         "eraft_root": str(eraft_root),
         "checkpoint": str(checkpoint),
+        **checkpoint_metadata,
         "bins": args.bins,
         "model_input_hw": [args.input_height, args.input_width],
         "native_hw": list(NATIVE_HW),
@@ -825,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
                 ["git", "status", "--porcelain"], cwd=REPOSITORY_ROOT, text=True,
                 capture_output=True, check=False).stdout.strip()),
             "eraft_commit": git_head(eraft_root),
-            "checkpoint_sha256": sha256_file(checkpoint),
+            **checkpoint_metadata,
             "checkpoint_load": checkpoint_load,
             "python": platform.python_version(),
             "numpy": np.__version__,
@@ -853,7 +882,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json_dumps({"status": decision["status"], "metrics": metrics,
                           "environment": environment}), flush=True)
         return 0
-    except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
+    except (ImportError, OSError, RuntimeError, ValueError, KeyError, pickle.UnpicklingError) as exc:
         error = {"type": type(exc).__name__, "message": str(exc)}
         config["status"] = "blocked"
         config["blocked_error"] = error
@@ -867,7 +896,7 @@ def main(argv: list[str] | None = None) -> int:
                 "python": platform.python_version(),
                 "numpy": np.__version__,
                 "eraft_commit": None,
-                "checkpoint_sha256": None,
+                **checkpoint_metadata,
                 "numpy_global_monkey_patch": False,
                 "status": "blocked_before_environment_capture_completed",
             }
@@ -875,14 +904,15 @@ def main(argv: list[str] | None = None) -> int:
                 blocked_environment["eraft_commit"] = git_head(eraft_root)
             except (OSError, RuntimeError):
                 pass
-            try:
-                blocked_environment["checkpoint_sha256"] = sha256_file(checkpoint)
-            except OSError:
-                pass
             atomic_write_json(environment_path, blocked_environment)
         (output_dir / "summary.md").write_text(
             "# R3a E-RAFT/SEVD smoke summary\n\n"
-            f"- Status: **blocked**\n- Error: `{type(exc).__name__}: {exc}`\n",
+            f"- Status: **blocked**\n- Error: `{type(exc).__name__}: {exc}`\n"
+            f"- Checkpoint path: `{checkpoint_metadata['checkpoint_path']}`\n"
+            f"- Checkpoint size: {checkpoint_metadata['checkpoint_size_bytes']} bytes\n"
+            f"- Checkpoint SHA-256: `{checkpoint_metadata['checkpoint_sha256']}`\n"
+            "- torch.load weights_only: `false`\n"
+            "- Trusted official-source checkpoint required: `true`\n",
             encoding="utf-8",
         )
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

@@ -146,4 +146,6 @@ CUDA_VISIBLE_DEVICES=0 python tools/smoke_eraft_sevd.py \
 
 成功完成接口运行后，输出 `config.json`、`environment.json`、`metrics.json`、`prediction.npz`、`qualitative.png` 和 `summary.md`。`prediction.npz` 的正式 `flow` 始终是正确 packet 顺序和正号的原生 1280×960 pixel displacement；负号及 swapped-event 只作诊断，绝不自动替换正式结果。
 
+PyTorch 2.6 加载官方 legacy `dsec.tar` 时显式使用 `weights_only=False`，随后仍以 `strict=True` 加载 state dict。由于关闭 `weights_only` 可能执行 pickle 内容，该入口只允许用于用户明确提供并确认来自官方 E-RAFT 下载地址的 checkpoint，禁止用于来源未知的 checkpoint；运行记录会保存 checkpoint 路径、文件大小、SHA-256 和该安全选择。
+
 本 smoke 只有在 checkpoint strict load、输入输出 shape/finite/尺度正确、预测非全零、正号明显优于负号且正确顺序明显优于 swapped 时才标记 `passed`。否则写出 `blocked` 与原因；这表示接口、方向或单样本诊断尚未通过，不代表正式 E-RAFT 泛化结论。timestamp 单位、Event 区间归属、flow GT 解码仍沿用 R1.2/R3a audit 的既有边界，不在本轮重新论证。
