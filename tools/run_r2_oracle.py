@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the minimal Qwen vision-feature + SEVD GT-flow oracle R2a smoke test."""
+"""Run R2 Qwen vision-feature + SEVD GT-flow oracle validation."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from PIL import Image
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -29,7 +30,12 @@ from event_delta.flow_warp import (  # noqa: E402
     sevd_flow_to_pixel_displacement,
 )
 from event_delta.json_io import atomic_write_json, json_dumps  # noqa: E402
-from event_delta.metrics import compare_stale_and_propagated, summarize_by_offset  # noqa: E402
+from event_delta.metrics import (  # noqa: E402
+    bootstrap_window_reductions,
+    compare_stale_and_propagated,
+    grouped_motion_aggregates,
+    summarize_by_offset,
+)
 from event_delta.qwen_features import (  # noqa: E402
     ProbeError,
     QwenVisionExtractor,
@@ -81,6 +87,11 @@ def read_flow(path: Path) -> np.ndarray:
     return flow
 
 
+def read_rgb(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB"))
+
+
 def window_flow_activity(flow: dict[int, Path], anchor: int, max_offset: int) -> float:
     values = []
     for identifier in range(anchor, anchor + max_offset):
@@ -112,6 +123,8 @@ def candidate_anchors(rgb: dict[int, Path], flow: dict[int, Path], anchor_stride
 
 def select_activity_windows(rgb: dict[int, Path], flow: dict[int, Path], count: int,
                             anchor_stride: int, max_offset: int, seed: int) -> list[dict[str, Any]]:
+    if count == 0:
+        return []
     anchors = candidate_anchors(rgb, flow, anchor_stride, max_offset)
     if len(anchors) < count:
         raise ValueError(f"only {len(anchors)} complete stride-aligned windows are available; requested {count}")
@@ -125,11 +138,36 @@ def select_activity_windows(rgb: dict[int, Path], flow: dict[int, Path], count: 
         positions = [len(scored) // 2]
     else:
         positions = [round(index * (len(scored) - 1) / (count - 1)) for index in range(count)]
+    quantiles = [index / max(count - 1, 1) if count > 1 else 0.5 for index in range(count)]
     labels = (["low", "mid", "high"] if count == 3
-              else [f"activity_quantile_{index / max(count - 1, 1):.2f}" for index in range(count)])
+              else [f"activity_quantile_{quantile:.2f}" for quantile in quantiles])
+    activity_groups = [("low" if quantile < 1 / 3 else "mid" if quantile < 2 / 3 else "high")
+                       for quantile in quantiles]
     return [{"anchor_frame_id": scored[position][2], "flow_activity_mean_pixels": scored[position][0],
-             "activity_stratum": label, "activity_rank": position + 1,
-             "candidate_window_count": len(scored)} for position, label in zip(positions, labels)]
+             "activity_stratum": label, "activity_group": activity_group,
+             "activity_quantile": quantile, "activity_rank": position + 1,
+             "candidate_window_count": len(scored)}
+            for position, label, activity_group, quantile
+            in zip(positions, labels, activity_groups, quantiles)]
+
+
+def allocate_window_counts(recordings: list[str], total_windows: int) -> dict[str, int]:
+    """Allocate a total window budget evenly; CLI-order recordings receive any remainder."""
+    if not recordings or len(set(recordings)) != len(recordings):
+        raise ValueError("--recording values must be non-empty and unique")
+    if total_windows < len(recordings):
+        raise ValueError("--windows is the total across recordings and must allow at least one per recording")
+    base, remainder = divmod(total_windows, len(recordings))
+    return {recording: base + (index < remainder) for index, recording in enumerate(recordings)}
+
+
+def select_qualitative_anchors(selected: list[dict[str, Any]], recordings: list[str]) -> dict[str, int]:
+    """Select the highest-activity sampled window independently for each recording."""
+    return {
+        recording: int(max((window for window in selected if window["recording"] == recording),
+                           key=lambda window: window["flow_activity_mean_pixels"])["anchor_frame_id"])
+        for recording in recordings
+    }
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -244,18 +282,48 @@ def plot_metrics(offset_rows: list[dict[str, Any]], output_dir: Path) -> None:
 def plot_qualitative(example: dict[str, Any], output: Path) -> None:
     plt = _matplotlib()
     stale, propagated, target = example["stale"], example["propagated"], example["target"]
-    panels = (np.linalg.norm(stale, axis=-1), np.linalg.norm(propagated, axis=-1),
-              np.linalg.norm(target, axis=-1), np.linalg.norm(propagated - target, axis=-1), example["valid"],
-              example["motion"])
-    titles = ("stale feature norm", "propagated feature norm", "target feature norm",
-              "propagated residual L2", "valid/coverage mask", "motion-token mask")
-    fig, axes = plt.subplots(2, 3, figsize=(13, 8))
-    for axis, panel, title in zip(axes.reshape(-1), panels, titles):
-        shown = axis.imshow(panel, cmap="magma")
-        fig.colorbar(shown, ax=axis, fraction=0.046, pad=0.04)
-        axis.set_title(title)
+    stale_residual = np.linalg.norm(stale - target, axis=-1)
+    propagated_residual = np.linalg.norm(propagated - target, axis=-1)
+    improvement = stale_residual - propagated_residual
+    valid = np.asarray(example["valid"], dtype=bool)
+    residual_values = np.concatenate((stale_residual[valid], propagated_residual[valid]))
+    residual_limit = float(np.percentile(residual_values, 99)) if residual_values.size else 1.0
+    residual_limit = max(residual_limit, 1e-12)
+    flow = np.asarray(example["flow_magnitude_pixels"])
+    finite_flow = flow[np.isfinite(flow) & (flow > 0)]
+    flow_limit = float(np.percentile(finite_flow, 99)) if finite_flow.size else 1.0
+    flow_limit = max(flow_limit, 1e-12)
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+    axes = axes.reshape(-1)
+    axes[0].imshow(example["anchor_rgb"])
+    axes[0].set_title("anchor RGB (method input)")
+    axes[1].imshow(example["target_rgb"])
+    axes[1].set_title("target RGB (offline GT only)")
+    shown = axes[2].imshow(flow, cmap="magma", vmin=0, vmax=flow_limit)
+    axes[2].set_title("current GT-flow magnitude [pixel]")
+    fig.colorbar(shown, ax=axes[2], fraction=0.046, pad=0.04)
+    shown = axes[3].imshow(np.where(valid, stale_residual, np.nan),
+                           cmap="magma", vmin=0, vmax=residual_limit)
+    axes[3].set_title("stale residual L2 (valid mask)")
+    fig.colorbar(shown, ax=axes[3], fraction=0.046, pad=0.04)
+    shown = axes[4].imshow(np.where(valid, propagated_residual, np.nan),
+                           cmap="magma", vmin=0, vmax=residual_limit)
+    axes[4].set_title("propagated residual L2 (valid mask)")
+    fig.colorbar(shown, ax=axes[4], fraction=0.046, pad=0.04)
+    shown = axes[5].imshow(np.where(valid, improvement, np.nan),
+                           cmap="coolwarm", vmin=-residual_limit, vmax=residual_limit)
+    axes[5].set_title("stale - propagated residual (positive=better)")
+    fig.colorbar(shown, ax=axes[5], fraction=0.046, pad=0.04)
+    axes[6].imshow(valid, cmap="gray", vmin=0, vmax=1)
+    axes[6].set_title("valid/coverage mask")
+    axes[7].imshow(valid & np.asarray(example["motion"], dtype=bool), cmap="gray", vmin=0, vmax=1)
+    axes[7].set_title("motion & valid mask")
+    for axis in axes:
         axis.axis("off")
-    fig.suptitle(f"{example['recording']} anchor={example['anchor']} offset={example['offset']}")
+    fig.suptitle(f"{example['recording']} anchor={example['anchor']} offset={example['offset']} "
+                 f"activity={example['activity_stratum']} ({example['activity_group']}) | "
+                 f"valid tokens={example['all_valid_token_count']}, motion tokens={example['motion_token_count']}")
     fig.tight_layout()
     fig.savefig(output, dpi=140)
     plt.close(fig)
@@ -269,6 +337,7 @@ def window_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for (recording, anchor), group in groups.items():
         item: dict[str, Any] = {"recording": recording, "anchor_frame_id": anchor,
                                 "activity_stratum": group[0]["activity_stratum"],
+                                "activity_group": group[0]["activity_group"],
                                 "flow_activity_mean_pixels": group[0]["flow_activity_mean_pixels"],
                                 "offset_count": len(group)}
         for scope in ("all_valid", "motion"):
@@ -281,6 +350,8 @@ def window_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 for row in group if row.get(f"{scope}_propagated_cosine_distance") is not None
                 and row.get(f"{scope}_stale_cosine_distance") is not None]
             item[f"{scope}_win_rate"] = float(np.mean(wins)) if wins else None
+        item["motion_offset_count"] = sum(row.get("motion_stale_cosine_distance") is not None for row in group)
+        item["motion_token_count"] = sum(int(row.get("motion_token_count", 0)) for row in group)
         item["coverage_ratio_mean"] = float(np.mean([row["valid_coverage_ratio"] for row in group]))
         output.append(item)
     return output
@@ -288,45 +359,63 @@ def window_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def evaluate_criteria(rows: list[dict[str, Any]], offset_summary: list[dict[str, Any]],
                       efficiency: dict[str, Any], minimum_coverage: float,
-                      maximum_warp_vision_ratio: float) -> dict[str, Any]:
+                      maximum_warp_vision_ratio: float,
+                      bootstrap: dict[str, Any] | None = None) -> dict[str, Any]:
     recordings = sorted({row["recording"] for row in rows})
     motion_pairs = [(row["motion_stale_cosine_distance"], row["motion_propagated_cosine_distance"])
                     for row in rows if row.get("motion_stale_cosine_distance") is not None
                     and row.get("motion_propagated_cosine_distance") is not None]
-    motion_improvement = bool(motion_pairs) and np.mean([pair[1] for pair in motion_pairs]) < np.mean(
-        [pair[0] for pair in motion_pairs])
+    motion_improvement = (bool(np.mean([pair[1] for pair in motion_pairs]) < np.mean(
+        [pair[0] for pair in motion_pairs])) if motion_pairs else None)
     critical = [row for row in offset_summary if row["offset"] in {3, 5, 9}]
-    critical_wins = [row.get("motion_cosine_win_rate", 0) > 0.5 for row in critical]
-    majority_critical = len(critical) == 3 and sum(critical_wins) >= 2
+    critical_wins = [(row["offset"], row.get("motion_cosine_win_rate")) for row in critical]
+    available_critical = [value for _offset, value in critical_wins if value is not None]
+    majority_critical = len(available_critical) == 3 and sum(value > 0.5 for value in available_critical) >= 2
     per_recording = {}
     for recording in recordings:
         pairs = [(row["motion_stale_cosine_distance"], row["motion_propagated_cosine_distance"])
                  for row in rows if row["recording"] == recording
                  and row.get("motion_stale_cosine_distance") is not None
                  and row.get("motion_propagated_cosine_distance") is not None]
-        per_recording[recording] = bool(pairs) and np.mean([b for _a, b in pairs]) < np.mean([a for a, _b in pairs])
+        per_recording[recording] = (bool(np.mean([b for _a, b in pairs]) < np.mean([a for a, _b in pairs]))
+                                    if pairs else None)
     coverage = float(np.mean([row["valid_coverage_ratio"] for row in rows]))
     enough_coverage = coverage >= minimum_coverage
     warp_fast = efficiency["warp_to_vision_p50_ratio"] < maximum_warp_vision_ratio
+    bootstrap_groups = {item["group"]: item for item in (bootstrap or {}).get("groups", [])}
+    required_bootstrap_groups = ["overall", *recordings]
+    def bootstrap_group_is_positive(name: str) -> bool:
+        group = bootstrap_groups.get(name, {})
+        macro_low = group.get("window_macro", {}).get("ci95_low")
+        micro_low = group.get("motion_token_weighted_micro", {}).get("ci95_low")
+        return macro_low is not None and micro_low is not None and macro_low > 0 and micro_low > 0
+
+    bootstrap_ci_positive = bool(bootstrap_groups) and all(
+        bootstrap_group_is_positive(name) for name in required_bootstrap_groups)
     criteria = {"two_recordings_present": len(recordings) >= 2,
-                "motion_cosine_improves_aggregated": bool(motion_improvement),
+                "motion_cosine_improves_aggregated": motion_improvement,
                 "critical_offsets_3_5_9_majority_win": bool(majority_critical),
+                "critical_offset_motion_win_rates": {str(offset): value for offset, value in critical_wins},
                 "improvement_consistent_by_recording": per_recording,
-                "not_background_only": bool(motion_improvement and motion_pairs),
+                "not_background_only": bool(motion_improvement is True and motion_pairs),
+                "bootstrap_macro_and_micro_ci_positive_overall_and_recordings": bootstrap_ci_positive,
                 "mean_coverage_ratio": coverage, "minimum_coverage_required": minimum_coverage,
                 "coverage_sufficient": enough_coverage,
                 "warp_vision_p50_ratio": efficiency["warp_to_vision_p50_ratio"],
                 "maximum_ratio_for_significantly_faster": maximum_warp_vision_ratio,
                 "warp_significantly_faster": warp_fast}
-    promising = (criteria["two_recordings_present"] and motion_improvement and majority_critical
-                 and all(per_recording.values()) and enough_coverage and warp_fast)
+    promising = (criteria["two_recordings_present"] and motion_improvement is True and majority_critical
+                 and all(value is True for value in per_recording.values())
+                 and bootstrap_ci_positive and enough_coverage and warp_fast)
     return {"status": "promising" if promising else "stop", "criteria": criteria,
             "next_step": ("eligible for a separately scoped Event-estimated-flow test" if promising else
                           "do not start E-RAFT/Event; first audit feature stage, grid ordering, and warp validity; if correct, record a kill result")}
 
 
 def summary_markdown(rows: list[dict[str, Any]], offset_summary: list[dict[str, Any]],
-                     efficiency: dict[str, Any], decision: dict[str, Any]) -> str:
+                     efficiency: dict[str, Any], decision: dict[str, Any],
+                     aggregates: list[dict[str, Any]], bootstrap: dict[str, Any],
+                     total_windows: int, windows_per_recording: dict[str, int]) -> str:
     def mean(key: str, subset: list[dict[str, Any]] = rows) -> float | None:
         values = [row[key] for row in subset if row.get(key) is not None]
         return float(np.mean(values)) if values else None
@@ -335,17 +424,22 @@ def summary_markdown(rows: list[dict[str, Any]], offset_summary: list[dict[str, 
     last = [row for row in rows if row["offset"] == max(item["offset"] for item in rows)]
     stale_worsens = (mean("all_valid_stale_cosine_distance", last) or 0) > (
         mean("all_valid_stale_cosine_distance", first) or 0)
-    return f"""# R2a Qwen GT-flow oracle propagation smoke test
+    overall = next(item for item in aggregates if item["group_type"] == "overall")
+    bootstrap_groups = {item["group"]: item for item in bootstrap["groups"]}
+    return f"""# R2b expanded Qwen GT-flow oracle validation
 
 Decision: **{decision['status']}**
 
+Windows: total={total_windows}; per recording={json_dumps(windows_per_recording)}. Motion windows={overall['motion_window_count']}/{overall['window_count']}; motion tokens={overall['motion_token_count']}.
+
 1. Stale feature 随 anchor age 变差：**{'yes' if stale_worsens else 'no/unclear'}**（offset 1 mean={mean('all_valid_stale_cosine_distance', first)}, final mean={mean('all_valid_stale_cosine_distance', last)}）。
 2. GT-flow propagation 比 stale 更接近 dense target：all-valid cosine stale={mean('all_valid_stale_cosine_distance')}，propagated={mean('all_valid_propagated_cosine_distance')}。
-3. Motion tokens：stale={mean('motion_stale_cosine_distance')}，propagated={mean('motion_propagated_cosine_distance')}；聚合改善={decision['criteria']['motion_cosine_improves_aggregated']}。
-4. fixed-3/fixed-4 一致性：`{decision['criteria']['improvement_consistent_by_recording']}`。
-5. Warp coverage：mean={decision['criteria']['mean_coverage_ratio']}，门槛={decision['criteria']['minimum_coverage_required']}，足够={decision['criteria']['coverage_sufficient']}。
+3. Motion tokens：window-macro reduction={overall['window_macro_cosine_error_reduction']}；token-weighted micro reduction={overall['motion_token_micro_cosine_error_reduction']}；无 motion 的 window/offset 记为 N/A。
+4. fixed-3/fixed-4 一致性：`{json_dumps(decision['criteria']['improvement_consistent_by_recording'])}`。
+5. Warp coverage：mean={decision['criteria']['mean_coverage_ratio']}，门槛={decision['criteria']['minimum_coverage_required']}，足够={json_dumps(decision['criteria']['coverage_sufficient'])}。
 6. Latency：ViT P50={efficiency['vision_encoder']['p50_ms']} ms，warp P50={efficiency['single_feature_warp']['p50_ms']} ms，比例={efficiency['warp_to_vision_p50_ratio']}，理论 dense/oracle speedup={efficiency['theoretical_speedup']}。
-7. 是否进入 Event-estimated flow：**{decision['next_step']}**。
+7. Window bootstrap（seed={bootstrap['seed']}，replicates={bootstrap['replicates']}）：overall macro 95% CI={bootstrap_groups['overall']['window_macro']['ci95_low']}..{bootstrap_groups['overall']['window_macro']['ci95_high']}；overall micro 95% CI={bootstrap_groups['overall']['motion_token_weighted_micro']['ci95_low']}..{bootstrap_groups['overall']['motion_token_weighted_micro']['ci95_high']}；overall/recording CI 全部为正={json_dumps(decision['criteria']['bootstrap_macro_and_micro_ci_positive_overall_and_recordings'])}。
+8. 是否进入 Event-estimated flow：**{decision['next_step']}**。
 
 ## Boundary
 
@@ -360,7 +454,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--recording", required=True, action="append")
     parser.add_argument("--model", default="Qwen/Qwen3-VL-2B-Instruct")
-    parser.add_argument("--windows", type=int, default=6)
+    parser.add_argument("--windows", type=int, default=6,
+                        help="total number of windows across all recordings")
     parser.add_argument("--anchor-stride", type=int, default=10)
     parser.add_argument("--max-offset", type=int, default=9)
     parser.add_argument("--seed", type=int, default=20260929)
@@ -371,6 +466,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--motion-threshold-pixels", type=float, default=1.0)
     parser.add_argument("--minimum-coverage", type=float, default=0.5)
     parser.add_argument("--maximum-warp-vision-ratio", type=float, default=0.25)
+    parser.add_argument("--bootstrap-replicates", type=int, default=2000)
     parser.add_argument("--profile-warmup", type=int, default=3)
     parser.add_argument("--profile-repeats", type=int, default=10)
     return parser.parse_args(argv)
@@ -379,11 +475,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     root, output_dir = args.root.expanduser().resolve(), args.output_dir.expanduser().resolve()
-    if not root.is_dir() or args.windows <= 0 or args.max_offset <= 0 or args.anchor_stride <= 0:
+    if (not root.is_dir() or args.windows <= 0 or args.max_offset <= 0 or args.anchor_stride <= 0
+            or args.bootstrap_replicates <= 0):
         print("error: invalid root/windows/stride/offset", file=sys.stderr)
         return 2
-    if args.windows % len(args.recording):
-        print("error: --windows must divide evenly across recordings", file=sys.stderr)
+    try:
+        window_counts = allocate_window_counts(args.recording, args.windows)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -406,7 +505,6 @@ def main(argv: list[str] | None = None) -> int:
     }
     print(json_dumps(startup_runtime), flush=True)
     atomic_write_json(output_dir / "config.json", {"status": "starting", "runtime": startup_runtime})
-    per_recording_count = args.windows // len(args.recording)
     indexes, selected = {}, []
     phase_start = time.perf_counter()
     print("resolving recordings", flush=True)
@@ -421,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         print("sampling windows (reads and decompresses candidate flow NPZ files on CPU)", flush=True)
         for position, recording in enumerate(args.recording):
             rgb, flow = indexes[recording]["rgb"], indexes[recording]["flow"]
-            chosen = select_activity_windows(rgb, flow, per_recording_count, args.anchor_stride,
+            chosen = select_activity_windows(rgb, flow, window_counts[recording], args.anchor_stride,
                                              args.max_offset, args.seed + position)
             selected.extend({"recording": recording, **item} for item in chosen)
         print(f"sampling windows done in {time.perf_counter() - phase_start:.1f}s", flush=True)
@@ -435,12 +533,14 @@ def main(argv: list[str] | None = None) -> int:
                           "rgb_last": max(value["rgb"]), "flow_count": len(value["flow"]),
                           "flow_first": min(value["flow"]), "flow_last": max(value["flow"])}
                    for name, value in indexes.items()}
-    config = {"scope": "R2a Qwen vision-feature + GT-flow oracle propagation smoke test",
+    config = {"scope": "R2b expanded Qwen vision-feature + GT-flow oracle validation",
               "dataset_root": str(root), "recordings": args.recording, "model": args.model,
               "git_commit": revision, "data_ranges": data_ranges,
               "requested_device": args.device,
               "runtime": startup_runtime,
-              "seed": args.seed, "windows": args.windows, "windows_per_recording": per_recording_count,
+              "seed": args.seed, "windows": args.windows, "total_windows": args.windows,
+              "windows_per_recording": window_counts,
+              "window_allocation_rule": "balanced across recordings in CLI order; first total_windows % recording_count recordings receive one extra",
               "anchor_stride": args.anchor_stride, "max_offset": args.max_offset,
               "feature_stage": args.feature_stage, "motion_threshold_pixels": args.motion_threshold_pixels,
               "minimum_coverage": args.minimum_coverage,
@@ -455,6 +555,8 @@ def main(argv: list[str] | None = None) -> int:
               "causality": {"method_inputs": "anchor RGB and flows up to current transition",
                             "target_rgb": "offline dense-feature ground truth only",
                             "target_feature_hole_filling": False},
+              "bootstrap": {"sampling_unit": "window", "seed": args.seed,
+                            "replicates": args.bootstrap_replicates},
               "profiling": {"warmup": args.profile_warmup, "repeats": args.profile_repeats}}
     atomic_write_json(output_dir / "config.json", config)
 
@@ -492,7 +594,8 @@ def main(argv: list[str] | None = None) -> int:
     if extractor.device.type == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
-    rows, qualitative = [], None
+    rows, qualitative_examples = [], {}
+    qualitative_anchors = select_qualitative_anchors(selected, args.recording)
     representative_feature = representative_displacement = None
     try:
         for window_index, window in enumerate(selected, 1):
@@ -534,16 +637,28 @@ def main(argv: list[str] | None = None) -> int:
                 rows.append({"recording": recording, "anchor_frame_id": anchor,
                              "target_frame_id": anchor + offset, "offset": offset,
                              "activity_stratum": window["activity_stratum"],
+                             "activity_group": window["activity_group"],
+                             "activity_quantile": window["activity_quantile"],
                              "flow_activity_mean_pixels": window["flow_activity_mean_pixels"],
                              "current_transition_flow_frame_id": transition,
                              "flow_original_height": raw_numpy.shape[0],
                              "flow_original_width": raw_numpy.shape[1],
                              "step_coverage_ratio": coverage,
                              "coverage_history": json_dumps(coverage_history), **metrics})
-                if qualitative is None and offset == args.max_offset:
-                    qualitative = {"recording": recording, "anchor": anchor, "offset": offset,
-                                   "stale": stale_numpy, "propagated": propagated_numpy,
-                                   "target": target_numpy, "valid": valid_numpy, "motion": motion_numpy}
+                if anchor == qualitative_anchors[recording] and offset == args.max_offset:
+                    original_pixel_displacement = sevd_flow_to_pixel_displacement(raw_numpy, raw_numpy.shape[:2])
+                    qualitative_examples[recording] = {
+                        "recording": recording, "anchor": anchor, "offset": offset,
+                        "activity_stratum": window["activity_stratum"],
+                        "activity_group": window["activity_group"],
+                        "stale": stale_numpy, "propagated": propagated_numpy,
+                        "target": target_numpy, "valid": valid_numpy, "motion": motion_numpy,
+                        "all_valid_token_count": metrics["all_valid_token_count"],
+                        "motion_token_count": metrics["motion_token_count"],
+                        "anchor_rgb": read_rgb(rgb[anchor]),
+                        "target_rgb": read_rgb(rgb[anchor + offset]),
+                        "flow_magnitude_pixels": np.linalg.norm(original_pixel_displacement, axis=-1),
+                    }
                 if representative_feature is None:
                     representative_feature, representative_displacement = anchor_feature, displacement
             print(f"window done: recording={recording} window={window_index}/{len(selected)} anchor={anchor} "
@@ -556,22 +671,31 @@ def main(argv: list[str] | None = None) -> int:
     print("aggregating/writing results", flush=True)
     offset_summary = summarize_by_offset(rows)
     windows = window_summaries(rows)
+    aggregates = grouped_motion_aggregates(rows)
+    bootstrap = bootstrap_window_reductions(rows, args.bootstrap_replicates, args.seed)
     write_csv(output_dir / "per_offset_metrics.csv", rows)
     write_csv(output_dir / "window_summary.csv", windows)
+    write_csv(output_dir / "aggregate_metrics.csv", aggregates)
+    atomic_write_json(output_dir / "bootstrap.json", bootstrap)
     efficiency = profile_efficiency(extractor, first_image, args.feature_stage, representative_feature,
                                     representative_displacement, args.profile_warmup, args.profile_repeats)
     atomic_write_json(output_dir / "efficiency.json", efficiency)
     decision = evaluate_criteria(rows, offset_summary, efficiency, args.minimum_coverage,
-                                 args.maximum_warp_vision_ratio)
-    results = {"offset_summary": offset_summary, "decision": decision}
+                                 args.maximum_warp_vision_ratio, bootstrap)
+    results = {"offset_summary": offset_summary, "motion_aggregates": aggregates,
+               "bootstrap": bootstrap, "decision": decision}
     config["results"] = results
     atomic_write_json(output_dir / "config.json", config)
     plot_metrics(offset_summary, output_dir)
-    if qualitative is None:
-        raise RuntimeError("no qualitative example was produced")
-    plot_qualitative(qualitative, output_dir / "qualitative_features.png")
-    (output_dir / "summary.md").write_text(summary_markdown(rows, offset_summary, efficiency, decision),
-                                             encoding="utf-8")
+    missing_qualitative = sorted(set(args.recording) - set(qualitative_examples))
+    if missing_qualitative:
+        raise RuntimeError(f"no high-activity qualitative example for: {missing_qualitative}")
+    for recording, example in qualitative_examples.items():
+        plot_qualitative(example, output_dir / f"qualitative_features_{recording}_high.png")
+    plot_qualitative(qualitative_examples[args.recording[0]], output_dir / "qualitative_features.png")
+    (output_dir / "summary.md").write_text(
+        summary_markdown(rows, offset_summary, efficiency, decision, aggregates, bootstrap,
+                         args.windows, window_counts), encoding="utf-8")
     print(f"aggregating/writing results done in {time.perf_counter() - phase_start:.1f}s", flush=True)
     print(f"wrote {output_dir}; decision={decision['status']}", flush=True)
     return 0

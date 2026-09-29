@@ -1,6 +1,6 @@
 # event-delta
 
-目标：验证低频 RGB 语义锚点与连续 Event 状态增量能否以较低成本改善流式 VLM 在任意查询时刻的状态与回答。R1/R1.2 负责数据约定验证；R2a 只做 Qwen vision feature 与 GT-flow oracle propagation 的最小 kill test，不涉及训练、LLM generation/QA 或 Event encoder。
+目标：验证低频 RGB 语义锚点与连续 Event 状态增量能否以较低成本改善流式 VLM 在任意查询时刻的状态与回答。R1/R1.2 负责数据约定验证；R2a/R2b 只做 Qwen vision feature 与 GT-flow oracle propagation 的最小及扩展验证，不涉及训练、LLM generation/QA 或 Event encoder。
 
 ## R1/R1.1：SEVD 静态审计
 
@@ -64,7 +64,7 @@ python tools/probe_qwen_vision.py \
 
 probe 使用 BF16、SDPA、eval 和 inference mode，只运行 vision module。它通过实际模块结构和 hooks 记录 last vision block、merger 前后 feature、最终 visual tokens、grid/token 一致性和安装版本源码中的 token-order 证据。若源码不能可靠证明二维 grid 顺序，状态为 `blocked`，不会猜测 row-major 后继续。
 
-运行 6-window oracle smoke test：
+运行 6-window oracle smoke test。`--windows` 始终表示所有 `--recording` 合计的窗口总数，不是每条 recording 的数量；这里总计 6，因此 fixed-3/fixed-4 各 3 个：
 
 ```bash
 mkdir -p artifacts/r2_smoke
@@ -82,11 +82,39 @@ python tools/run_r2_oracle.py \
   --local-files-only
 ```
 
-每条 recording 自动按 9-step window 的 GT-flow mean pixel activity 选择 low/mid/high 三个窗口。默认比较 post-merger feature；只有 probe 确认 pre-merger merge-blocked 顺序可逆时，才可显式使用 `--feature-stage pre_merger`。
+窗口预算尽量均分；不能整除时，按 CLI 中 `--recording` 的顺序把余数逐一分给前面的 recording，并在 `config.json` 中记录 `total_windows`、逐 recording 的 `windows_per_recording` 和分配规则。每条 recording 自动按 9-step window 的 GT-flow mean pixel activity 均匀覆盖 activity ranks；3 个窗口时对应 low/mid/high，更多窗口时记录精确 activity quantile，并额外归入 low/mid/high 三组。默认比较 post-merger feature；只有 probe 确认 pre-merger merge-blocked 顺序可逆时，才可显式使用 `--feature-stage pre_merger`。
 
-输出为 `probe.json`、`config.json`、`per_offset_metrics.csv`、`window_summary.csv`、`efficiency.json`、`summary.md`、`distance_vs_offset.png`、`recovery_vs_offset.png` 和 `qualitative_features.png`。其中 target RGB 只用于 offline dense-feature ground truth；stale/propagated 方法路径不会用 target feature 填补 splatting holes。
+逐窗口原始输出保留为 `per_offset_metrics.csv` 和 `window_summary.csv`。此外输出 `aggregate_metrics.csv`（window-macro、motion-token-count weighted micro，以及 overall、recording、activity group、offset 和交叉分组）、`bootstrap.json`、`probe.json`、`config.json`、`efficiency.json`、`summary.md`、`distance_vs_offset.png`、`recovery_vs_offset.png`、兼容用 `qualitative_features.png`，以及每条 recording 的 `qualitative_features_<recording>_high.png`。无 motion token 的窗口或分组记为 N/A，不按 motion failure 或 win=0 处理。其中 target RGB 只用于 offline dense-feature ground truth；stale/propagated 方法路径不会用 target feature 填补 splatting holes。
 
 GT flow 是 oracle，不是最终 Event 方法。该 smoke test 只回答“避免重复 ViT 是否可能省计算”，不代表 Event encoder 的最终成本；它不运行 LLM generation/QA、不训练模型，也不实现 Event encoder、E-RAFT 或 EventFlash。只有 motion-token cosine distance 改善、offset 3/5/9 多数获胜、改善不只来自固定背景、coverage 足够且 warp 显著快于 vision encode 时，才标记为 `promising`。否则先检查 feature stage、grid ordering 和 warp validity；若三者正确，则记录 kill result 并停止传播路线。
+
+### R2b：expanded-oracle validation
+
+R2b 不改变 R2a 的 post-merger feature、GT-flow convention、motion threshold、因果输入或 efficiency 定义，只把独立采样单位扩展到 60 个窗口。正式服务器命令为：
+
+```bash
+mkdir -p artifacts/r2b_expanded
+CUDA_VISIBLE_DEVICES=0 python tools/run_r2_oracle.py \
+  --root "$SEVD_ROOT" \
+  --recording fixed-3 \
+  --recording fixed-4 \
+  --model Qwen/Qwen3-VL-2B-Instruct \
+  --windows 60 \
+  --anchor-stride 10 \
+  --max-offset 9 \
+  --seed 20260929 \
+  --feature-stage post_merger \
+  --bootstrap-replicates 2000 \
+  --profile-warmup 3 \
+  --profile-repeats 10 \
+  --device cuda \
+  --output-dir artifacts/r2b_expanded \
+  --local-files-only
+```
+
+Bootstrap 固定使用完整 window 作为重采样单位，并携带该 window 的全部 offsets；绝不把 token 或 window-offset row 当作独立样本。它分别报告 overall、fixed-3、fixed-4 的 window-macro 与 motion-token weighted micro cosine error reduction 的 point estimate、bootstrap mean/median 和 percentile 95% CI。
+
+R2b 只有在保留 R2a 原有条件的同时，overall、fixed-3、fixed-4 的 macro 和 micro 95% CI 下界都大于 0，才判为 `promising`。任一分组没有 motion evidence 或 CI 跨过 0 均不算稳定复现；N/A 仍表示证据不足，不等同于 propagation failure。
 
 ### R2 troubleshooting
 
