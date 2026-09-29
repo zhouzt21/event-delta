@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +26,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from event_delta.flow_warp import sevd_flow_to_pixel_displacement  # noqa: E402
 from event_delta.json_io import atomic_write_json, json_dumps  # noqa: E402
 from tools.audit_sevd import find_recording, frame_id  # noqa: E402
-from tools.calibrate_sevd import read_event_npz, read_flow  # noqa: E402
+from tools.calibrate_sevd import read_flow  # noqa: E402
 
 
 ERAFT_COMMIT = "c58ce0524ea0ebfa9849991caafb547f44fe9bfd"
@@ -36,15 +36,17 @@ MOTION_THRESHOLD_PIXELS = 1.0
 POLARITY_MIN_EVENTS = 100
 POLARITY_MIN_ABS_CORRELATION = 0.05
 PIL_BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
+NUMPY_LEGACY_ALIASES = ("np.float", "np.int", "np.bool", "numpy.float", "numpy.int", "numpy.bool")
 
 
-def index_files(directory: Path, suffix: str) -> dict[int, Path]:
+def index_files(directory: Path, suffix: str, filename_suffix: str | None = None) -> dict[int, Path]:
     if not directory.is_dir():
         raise FileNotFoundError(f"required directory does not exist: {directory}")
     indexed: dict[int, Path] = {}
     duplicates: list[int] = []
     for path in sorted(directory.iterdir()):
-        if not path.is_file() or path.suffix.lower() != suffix:
+        if (not path.is_file() or path.suffix.lower() != suffix
+                or (filename_suffix is not None and not path.name.lower().endswith(filename_suffix))):
             continue
         identifier = frame_id(path)
         if identifier is None:
@@ -60,7 +62,7 @@ def index_files(directory: Path, suffix: str) -> dict[int, Path]:
 def resolve_transition_paths(root: Path, recording: str, source_frame_id: int) -> dict[str, Path]:
     """Resolve Event_i, Event_i+1, flow_i, RGB_i, and RGB_i+1 uniquely."""
     recording_root = find_recording(root.resolve(), recording).resolve()
-    events = index_files(recording_root / "dvs_camera", ".npz")
+    events = index_files(recording_root / "dvs_camera", ".npz", "-xytp.npz")
     flows = index_files(recording_root / "optical_flow_camera", ".npz")
     rgbs = index_files(recording_root / "rgb_camera", ".png")
     requested = {
@@ -78,7 +80,23 @@ def resolve_transition_paths(root: Path, recording: str, source_frame_id: int) -
             **{name: index[identifier] for name, (index, identifier) in requested.items()}}
 
 
-def validate_events(events: dict[str, np.ndarray], path: Path) -> dict[str, Any]:
+def read_sevd_events(path: Path) -> dict[str, np.ndarray]:
+    """Read only the confirmed SEVD ``dvs_events[x,y,t,pol]`` schema."""
+    with np.load(path, allow_pickle=False) as archive:
+        if "dvs_events" not in archive.files:
+            raise ValueError(f"Event NPZ must contain key 'dvs_events': {path}")
+        structured = np.asarray(archive["dvs_events"])
+    fields = structured.dtype.names
+    if fields is None or not {"x", "y", "t", "pol"}.issubset(fields):
+        raise ValueError(f"dvs_events must be structured with fields x/y/t/pol: {path}; fields={fields}")
+    return {name: np.asarray(structured[name]).reshape(-1) for name in ("x", "y", "t", "pol")}
+
+
+def validate_events(events: dict[str, np.ndarray], path: Path,
+                    source_hw: tuple[int, int] = NATIVE_HW) -> dict[str, Any]:
+    missing = sorted({"x", "y", "t", "pol"} - set(events))
+    if missing:
+        raise ValueError(f"Event packet is missing confirmed fields {missing}: {path}")
     lengths = {name: np.asarray(events[name]).reshape(-1).size for name in ("x", "y", "t", "pol")}
     if len(set(lengths.values())) != 1:
         raise ValueError(f"Event fields have different lengths in {path}: {lengths}")
@@ -93,9 +111,25 @@ def validate_events(events: dict[str, np.ndarray], path: Path) -> dict[str, Any]
         raise ValueError(f"Event timestamps are not monotonic nondecreasing: {path}")
     if timestamps[-1] == timestamps[0]:
         raise ValueError(f"Event packet has fewer than two distinct timestamps: {path}")
-    polarity = np.asarray(events["pol"]).reshape(-1).astype(bool, copy=False)
+    x = np.asarray(events["x"]).reshape(-1)
+    y = np.asarray(events["y"]).reshape(-1)
+    if not np.issubdtype(x.dtype, np.integer) or not np.issubdtype(y.dtype, np.integer):
+        raise ValueError(f"Event x/y must be integer fields: {path}; x={x.dtype}, y={y.dtype}")
+    source_height, source_width = source_hw
+    if np.any((x < 0) | (x >= source_width)) or np.any((y < 0) | (y >= source_height)):
+        raise ValueError(f"Event coordinates exceed source bounds {source_width}x{source_height}: {path}; "
+                         f"x=[{x.min()},{x.max()}], y=[{y.min()},{y.max()}]")
+    raw_polarity = np.asarray(events["pol"]).reshape(-1)
+    if raw_polarity.dtype != np.bool_:
+        raise ValueError(f"Event pol must use the confirmed bool dtype: {path}; got {raw_polarity.dtype}")
+    polarity = raw_polarity.astype(bool, copy=False)
     return {
         "event_count": count,
+        "fields": {name: str(np.asarray(events[name]).dtype) for name in ("x", "y", "t", "pol")},
+        "x_min": int(x.min()),
+        "x_max": int(x.max()),
+        "y_min": int(y.min()),
+        "y_max": int(y.max()),
         "timestamp_first": int(timestamps[0]),
         "timestamp_last": int(timestamps[-1]),
         "timestamp_span": int(timestamps[-1] - timestamps[0]),
@@ -153,6 +187,12 @@ def voxelize_events(events: dict[str, np.ndarray], bins: int = 15,
             voxel[nonzero_before] = selected - mean
     nonzero_after = int(np.count_nonzero(voxel))
     stats = {
+        "voxel_shape": [1, bins, height, width],
+        "voxel_dtype": str(voxel.dtype),
+        "voxel_finite": bool(np.isfinite(voxel).all()),
+        "coordinate_scale_xy": [width / source_width, height / source_height],
+        "coordinate_mapping": "x->width, y->height; no swap or flip",
+        "polarity_mapping": {"False": -1.0, "True": 1.0},
         "event_count": int(t.size),
         "timestamp_span": span,
         "positive_event_count": int(np.count_nonzero(polarity)),
@@ -180,6 +220,17 @@ def normalize_state_dict_prefix(state: Mapping[str, Any], expected_keys: set[str
     missing = sorted(expected_keys - keys)[:10]
     unexpected = sorted(keys - expected_keys)[:10]
     raise ValueError(f"checkpoint keys do not strictly match model; missing={missing}, unexpected={unexpected}")
+
+
+def checkpoint_prefix_action(state: Mapping[str, Any], expected_keys: set[str]) -> str:
+    keys = set(state)
+    if keys == expected_keys:
+        return "none"
+    if keys and all(key.startswith("module.") for key in keys):
+        stripped = {key[len("module."):] for key in keys}
+        if stripped == expected_keys:
+            return "stripped_uniform_module_prefix"
+    return "incompatible"
 
 
 def require_prediction(prediction: Any, expected: tuple[int, ...] = (1, 2, 480, 640)) -> Any:
@@ -220,8 +271,11 @@ def flow_metrics(prediction: np.ndarray, ground_truth: np.ndarray, mask: np.ndar
     valid = np.asarray(mask, dtype=bool) & np.isfinite(prediction).all(axis=-1) & np.isfinite(ground_truth).all(axis=-1)
     count = int(np.count_nonzero(valid))
     if not count:
-        return {"pixel_count": 0, "epe": None, "median_epe": None, "direction_cosine": None,
-                "direction_cosine_pixel_count": 0, "1PE": None, "2PE": None, "3PE": None}
+        return {"pixel_count": 0, "epe": None, "median_epe": None, "angular_error_degrees": None,
+                "endpoint_cosine": None, "directional_pixel_count": 0,
+                "predicted_magnitude_mean": None, "gt_magnitude_mean": None,
+                "predicted_to_gt_magnitude_ratio": None, "predicted_motion_coverage": None,
+                "gt_motion_recall": None, "1PE": None, "2PE": None, "3PE": None}
     pred = prediction[valid].astype(np.float64)
     truth = ground_truth[valid].astype(np.float64)
     epe = np.linalg.norm(pred - truth, axis=-1)
@@ -229,15 +283,45 @@ def flow_metrics(prediction: np.ndarray, ground_truth: np.ndarray, mask: np.ndar
     directional = (pred_norm > 1e-8) & (truth_norm > 1e-8)
     cosine = (np.sum(pred[directional] * truth[directional], axis=-1)
               / (pred_norm[directional] * truth_norm[directional])) if np.any(directional) else np.empty(0)
+    cosine = np.clip(cosine, -1, 1)
+    predicted_motion = pred_norm >= MOTION_THRESHOLD_PIXELS
+    gt_motion = truth_norm >= MOTION_THRESHOLD_PIXELS
+    gt_mean = float(np.mean(truth_norm))
     return {
         "pixel_count": count,
         "epe": float(np.mean(epe)),
         "median_epe": float(np.median(epe)),
-        "direction_cosine": float(np.mean(np.clip(cosine, -1, 1))) if cosine.size else None,
-        "direction_cosine_pixel_count": int(cosine.size),
+        "angular_error_degrees": float(np.mean(np.degrees(np.arccos(cosine)))) if cosine.size else None,
+        "endpoint_cosine": float(np.mean(cosine)) if cosine.size else None,
+        "directional_pixel_count": int(cosine.size),
+        "predicted_magnitude_mean": float(np.mean(pred_norm)),
+        "gt_magnitude_mean": gt_mean,
+        "predicted_to_gt_magnitude_ratio": float(np.mean(pred_norm) / gt_mean) if gt_mean > 1e-8 else None,
+        "predicted_motion_coverage": float(np.mean(predicted_motion)),
+        "gt_motion_recall": float(np.mean(predicted_motion[gt_motion])) if np.any(gt_motion) else None,
         "1PE": float(np.mean(epe > 1.0)),
         "2PE": float(np.mean(epe > 2.0)),
         "3PE": float(np.mean(epe > 3.0)),
+    }
+
+
+def prediction_statistics(prediction: np.ndarray, tensor_dtype: str | None = None,
+                          tensor_device: str | None = None) -> dict[str, Any]:
+    array = np.asarray(prediction)
+    magnitude = np.linalg.norm(array.astype(np.float64), axis=-1)
+    return {
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "model_tensor_dtype": tensor_dtype,
+        "model_tensor_device": tensor_device,
+        "finite": bool(np.isfinite(array).all()),
+        "nonzero_vector_ratio": float(np.mean(magnitude > 1e-6)),
+        "dx": {"min": float(np.min(array[..., 0])), "mean": float(np.mean(array[..., 0])),
+               "max": float(np.max(array[..., 0])), "std": float(np.std(array[..., 0]))},
+        "dy": {"min": float(np.min(array[..., 1])), "mean": float(np.mean(array[..., 1])),
+               "max": float(np.max(array[..., 1])), "std": float(np.std(array[..., 1]))},
+        "magnitude": {"min": float(np.min(magnitude)), "mean": float(np.mean(magnitude)),
+                      "max": float(np.max(magnitude)), "p99": float(np.percentile(magnitude, 99))},
     }
 
 
@@ -253,6 +337,46 @@ def signed_metric_report(prediction: np.ndarray, ground_truth: np.ndarray,
             "all_pixels": flow_metrics(-prediction, ground_truth, all_mask),
             "gt_motion_region": flow_metrics(-prediction, ground_truth, motion_mask),
         },
+    }
+
+
+def smoke_decision(correct: dict[str, Any], swapped: dict[str, Any],
+                   statistics: dict[str, Any], clear_margin: float = 0.05) -> dict[str, Any]:
+    """Conservative interface diagnostic; never changes the formal prediction."""
+    scope = ("gt_motion_region"
+             if correct["positive_prediction"]["gt_motion_region"]["pixel_count"]
+             else "all_pixels")
+    positive = correct["positive_prediction"][scope]
+    negative = correct["negative_prediction"][scope]
+    swapped_positive = swapped["positive_prediction"][scope]
+    reasons = []
+    if not statistics["finite"]:
+        reasons.append("prediction_non_finite")
+    if statistics["nonzero_vector_ratio"] == 0:
+        reasons.append("prediction_all_zero")
+    positive_epe = positive["epe"]
+    negative_epe = negative["epe"]
+    swapped_epe = swapped_positive["epe"]
+    if positive_epe is None or negative_epe is None or swapped_epe is None:
+        reasons.append("insufficient_valid_pixels")
+    else:
+        required_factor = 1.0 - clear_margin
+        if not positive_epe < negative_epe * required_factor:
+            reasons.append("positive_sign_not_clearly_better_than_negative")
+        if not positive_epe < swapped_epe * required_factor:
+            reasons.append("correct_packet_order_not_clearly_better_than_swapped")
+    ratio = positive.get("predicted_to_gt_magnitude_ratio")
+    if ratio is not None and (ratio < 0.01 or ratio > 100.0):
+        reasons.append("prediction_scale_is_obviously_incompatible_with_gt")
+    return {
+        "status": "passed" if not reasons else "blocked",
+        "diagnostic_scope": scope,
+        "clear_improvement_margin": clear_margin,
+        "reasons": reasons,
+        "formal_prediction_changed": False,
+        "positive_epe": positive_epe,
+        "negative_epe": negative_epe,
+        "swapped_positive_epe": swapped_epe,
     }
 
 
@@ -327,14 +451,33 @@ def select_device(torch: Any, requested: str) -> Any:
     return torch.device(requested)
 
 
+def numpy_compatibility_error(exc: BaseException) -> RuntimeError | None:
+    text = str(exc)
+    if any(alias in text for alias in NUMPY_LEGACY_ALIASES) or "has no attribute 'float'" in text \
+            or "has no attribute 'int'" in text or "has no attribute 'bool'" in text:
+        return RuntimeError(
+            "E-RAFT import failed because third-party code uses a removed NumPy alias. "
+            "Patch that external checkout locally (np.float->float/np.float64, np.int->int/np.int64, "
+            "np.bool->bool/np.bool_) and record the patch; EventDelta does not monkey-patch NumPy globally. "
+            f"Original error: {type(exc).__name__}: {exc}"
+        )
+    return None
+
+
 def load_model(torch: Any, eraft_root: Path, checkpoint_path: Path, bins: int,
-               mode: str, device: Any) -> Any:
+               mode: str, device: Any) -> tuple[Any, dict[str, Any]]:
     revision = git_head(eraft_root)
     if revision != ERAFT_COMMIT:
         raise RuntimeError(f"E-RAFT HEAD mismatch: expected {ERAFT_COMMIT}, got {revision}")
     if str(eraft_root) not in sys.path:
         sys.path.insert(0, str(eraft_root))
-    module = importlib.import_module("model.eraft")
+    try:
+        module = importlib.import_module("model.eraft")
+    except (AttributeError, ImportError) as exc:
+        compatibility = numpy_compatibility_error(exc)
+        if compatibility is not None:
+            raise compatibility from exc
+        raise
     module_path = Path(module.__file__).resolve()
     if eraft_root not in module_path.parents:
         raise ImportError(f"resolved model.eraft outside --eraft-root: {module_path}")
@@ -345,9 +488,19 @@ def load_model(torch: Any, eraft_root: Path, checkpoint_path: Path, bins: int,
     state = checkpoint["model"]
     if not isinstance(state, Mapping):
         raise ValueError("checkpoint['model'] must be a state-dict mapping")
-    normalized = normalize_state_dict_prefix(state, set(model.state_dict()))
+    expected_keys = set(model.state_dict())
+    prefix_action = checkpoint_prefix_action(state, expected_keys)
+    normalized = normalize_state_dict_prefix(state, expected_keys)
     model.load_state_dict(normalized, strict=True)
-    return model.to(device).eval()
+    metadata = {
+        "strict_load": True,
+        "state_dict_key_count": len(state),
+        "module_prefix_action": prefix_action,
+        "external_module_path": str(module_path),
+        "numpy_compatibility_adapter": "none",
+        "numpy_global_monkey_patch": False,
+    }
+    return model.to(device).eval(), metadata
 
 
 def timed_forward(torch: Any, model: Any, old: Any, new: Any, iterations: int,
@@ -403,14 +556,84 @@ def flow_color(flow: np.ndarray) -> np.ndarray:
     return np.clip(rgb * 255, 0, 255).astype(np.uint8)
 
 
+def event_visualization(events: dict[str, np.ndarray], shape: tuple[int, int] = NATIVE_HW) -> np.ndarray:
+    height, width = shape
+    x = np.asarray(events["x"]).reshape(-1).astype(np.int64)
+    y = np.asarray(events["y"]).reshape(-1).astype(np.int64)
+    polarity = np.asarray(events["pol"]).reshape(-1).astype(bool)
+    valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    positive = np.zeros(shape, dtype=np.float32)
+    negative = np.zeros(shape, dtype=np.float32)
+    np.add.at(positive, (y[valid & polarity], x[valid & polarity]), 1)
+    np.add.at(negative, (y[valid & ~polarity], x[valid & ~polarity]), 1)
+    activity = np.maximum(positive, negative)
+    nonzero = activity[activity > 0]
+    scale = max(float(np.percentile(nonzero, 99)) if nonzero.size else 0.0, 1.0)
+    image = np.full((height, width, 3), 245.0, dtype=np.float32)
+    image[..., 0] -= 220 * negative / scale
+    image[..., 1] -= 180 * activity / scale
+    image[..., 2] -= 220 * positive / scale
+    return np.clip(image, 0, 255).astype(np.uint8)
+
+
+def error_visualization(prediction: np.ndarray, ground_truth: np.ndarray) -> np.ndarray:
+    error = np.linalg.norm(prediction.astype(np.float64) - ground_truth.astype(np.float64), axis=-1)
+    finite = error[np.isfinite(error)]
+    scale = max(float(np.percentile(finite, 99)) if finite.size else 0.0, 1e-6)
+    normalized = np.clip(error / scale, 0, 1)
+    return np.stack((255 * normalized, 255 * np.sqrt(normalized), 255 * (1 - normalized)), axis=-1).astype(np.uint8)
+
+
+def labeled_panel(array: np.ndarray, label: str, size: tuple[int, int]) -> Image.Image:
+    width, height = size
+    panel_image = Image.fromarray(array.astype(np.uint8)).resize((width, height), PIL_BILINEAR)
+    output = Image.new("RGB", (width, height + 24), "white")
+    output.paste(panel_image, (0, 24))
+    ImageDraw.Draw(output).text((5, 5), label, fill="black")
+    return output
+
+
 def save_qualitative(path: Path, source_rgb: np.ndarray, target_rgb: np.ndarray,
+                     old_events: dict[str, np.ndarray], new_events: dict[str, np.ndarray],
                      prediction: np.ndarray, ground_truth: np.ndarray) -> None:
-    panels = [source_rgb, target_rgb, flow_color(prediction), flow_color(ground_truth)]
-    canvas = Image.new("RGB", (NATIVE_HW[1] * 2, NATIVE_HW[0] * 2))
-    for index, panel in enumerate(panels):
-        image = Image.fromarray(panel).resize((NATIVE_HW[1], NATIVE_HW[0]), PIL_BILINEAR)
-        canvas.paste(image, ((index % 2) * NATIVE_HW[1], (index // 2) * NATIVE_HW[0]))
+    panels = [
+        ("RGB source", source_rgb),
+        ("RGB target (evaluation only)", target_rgb),
+        ("Old Event_i from raw dvs_events", event_visualization(old_events)),
+        ("New Event_i+1 from raw dvs_events", event_visualization(new_events)),
+        ("GT flow_i (oracle evaluation)", flow_color(ground_truth)),
+        ("E-RAFT prediction i->i+1", flow_color(prediction)),
+        ("Endpoint error map (P99)", error_visualization(prediction, ground_truth)),
+    ]
+    cell = (400, 300)
+    canvas = Image.new("RGB", (cell[0] * 4, (cell[1] + 24) * 2), "white")
+    for index, (label, values) in enumerate(panels):
+        image = labeled_panel(values, label, cell)
+        canvas.paste(image, ((index % 4) * cell[0], (index // 4) * (cell[1] + 24)))
     canvas.save(path)
+
+
+def write_summary(path: Path, config: dict[str, Any], metrics: dict[str, Any]) -> None:
+    decision = metrics["decision"]
+    scope = decision["diagnostic_scope"]
+    positive = metrics["correct_old_new"]["positive_prediction"][scope]
+    lines = [
+        "# R3a E-RAFT/SEVD smoke summary",
+        "",
+        f"- Status: **{decision['status']}**",
+        f"- Mapping: Event_{config['source_frame_id']} + Event_{config['target_frame_id']} -> "
+        f"flow_{config['source_frame_id']} evaluation.",
+        f"- Formal result: positive-sign, correctly ordered prediction; diagnostic scope `{scope}`.",
+        f"- EPE: {positive['epe']}",
+        f"- Angular error (degrees): {positive['angular_error_degrees']}",
+        f"- Endpoint cosine: {positive['endpoint_cosine']}",
+        f"- Predicted/GT magnitude ratio: {positive['predicted_to_gt_magnitude_ratio']}",
+        f"- Block reasons: {decision['reasons'] or 'none'}",
+        "",
+        "Negative-sign and swapped-event results are diagnostics only and never replace the formal output.",
+        "GT flow is oracle evaluation data and is not an E-RAFT input.",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -425,7 +648,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-width", type=int, default=640)
     parser.add_argument("--iterations", type=int, default=12)
     parser.add_argument("--mode", choices=("standard",), default="standard")
-    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser.parse_args(argv)
 
@@ -442,36 +665,49 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --root/--eraft-root must be directories and --checkpoint must be a file", file=sys.stderr)
         return 2
     output_dir.mkdir(parents=True, exist_ok=True)
-
+    config: dict[str, Any] = {
+        "status": "starting",
+        "scope": "R3a E-RAFT flow-only single-transition smoke",
+        "recording": args.recording,
+        "source_frame_id": args.source_frame_id,
+        "target_frame_id": args.source_frame_id + 1,
+        "old_event_frame_id": args.source_frame_id,
+        "new_event_frame_id": args.source_frame_id + 1,
+        "gt_flow_frame_id": args.source_frame_id,
+        "eraft_root": str(eraft_root),
+        "checkpoint": str(checkpoint),
+        "bins": args.bins,
+        "model_input_hw": [args.input_height, args.input_width],
+        "native_hw": list(NATIVE_HW),
+        "coordinate_scale_xy": [args.input_width / NATIVE_HW[1], args.input_height / NATIVE_HW[0]],
+        "native_prediction_scale_xy": [NATIVE_HW[1] / args.input_width, NATIVE_HW[0] / args.input_height],
+        "iterations": args.iterations,
+        "mode": args.mode,
+        "flow_init": None,
+        "warm_start": False,
+        "requested_device": args.device,
+        "gt_motion_threshold_pixels": MOTION_THRESHOLD_PIXELS,
+        "formal_prediction": "correct old/new, source-to-target positive sign",
+        "diagnostics_do_not_select_sign_order_or_polarity": True,
+    }
+    atomic_write_json(output_dir / "config.json", config)
     try:
         paths = resolve_transition_paths(root, args.recording, args.source_frame_id)
         resolved_paths = {name: str(path) for name, path in paths.items()}
         print(json_dumps({"resolved_paths": resolved_paths}), flush=True)
-        config = {
-            "status": "starting",
-            "scope": "R3a E-RAFT flow-only single-transition smoke",
-            "recording": args.recording,
-            "source_frame_id": args.source_frame_id,
-            "target_frame_id": args.source_frame_id + 1,
-            "resolved_paths": resolved_paths,
-            "eraft_root": str(eraft_root),
-            "checkpoint": str(checkpoint),
-            "bins": args.bins,
-            "model_input_hw": list(MODEL_HW),
-            "native_hw": list(NATIVE_HW),
-            "iterations": args.iterations,
-            "mode": args.mode,
-            "flow_init": None,
-            "requested_device": args.device,
-            "gt_motion_threshold_pixels": MOTION_THRESHOLD_PIXELS,
-            "formal_prediction": "correct old/new, source-to-target positive sign",
-            "diagnostics_do_not_select_sign_order_or_polarity": True,
+        config["resolved_paths"] = resolved_paths
+        config["transition_mapping"] = {
+            "source_rgb": {"frame_id": args.source_frame_id, "path": resolved_paths["source_rgb"]},
+            "target_rgb": {"frame_id": args.source_frame_id + 1, "path": resolved_paths["target_rgb"]},
+            "old_event_packet": {"frame_id": args.source_frame_id, "path": resolved_paths["old_event"]},
+            "new_event_packet": {"frame_id": args.source_frame_id + 1, "path": resolved_paths["new_event"]},
+            "gt_evaluation_flow": {"frame_id": args.source_frame_id, "path": resolved_paths["gt_flow"]},
         }
         atomic_write_json(output_dir / "config.json", config)
 
         decode_start = time.perf_counter()
-        old_events = read_event_npz(paths["old_event"])
-        new_events = read_event_npz(paths["new_event"])
+        old_events = read_sevd_events(paths["old_event"])
+        new_events = read_sevd_events(paths["new_event"])
         raw_gt = read_flow(paths["gt_flow"])
         npz_decode_seconds = time.perf_counter() - decode_start
         old_validation = validate_events(old_events, paths["old_event"])
@@ -500,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError as exc:
             raise RuntimeError("PyTorch is required in the isolated E-RAFT environment") from exc
         device = select_device(torch, args.device)
-        model = load_model(torch, eraft_root, checkpoint, args.bins, args.mode, device)
+        model, checkpoint_load = load_model(torch, eraft_root, checkpoint, args.bins, args.mode, device)
         old_tensor = torch.from_numpy(old_voxel).to(device=device, dtype=torch.float32)
         new_tensor = torch.from_numpy(new_voxel).to(device=device, dtype=torch.float32)
         if device.type == "cuda":
@@ -521,13 +757,29 @@ def main(argv: list[str] | None = None) -> int:
         swapped_native = resize_prediction_native(swapped.detach().cpu().numpy())
         swapped_resize_seconds = time.perf_counter() - resize_start
         ground_truth = np.asarray(sevd_flow_to_pixel_displacement(raw_gt, NATIVE_HW), dtype=np.float32)
-        motion_mask = np.linalg.norm(ground_truth.astype(np.float64), axis=-1) >= MOTION_THRESHOLD_PIXELS
+        valid_mask = np.isfinite(ground_truth).all(axis=-1)
+        motion_mask = valid_mask & (np.linalg.norm(ground_truth.astype(np.float64), axis=-1)
+                                    >= MOTION_THRESHOLD_PIXELS)
+        correct_report = signed_metric_report(correct_native, ground_truth, motion_mask)
+        swapped_report = signed_metric_report(swapped_native, ground_truth, motion_mask)
+        correct_stats = prediction_statistics(correct_native, str(correct.dtype), str(correct.device))
+        swapped_stats = prediction_statistics(swapped_native, str(swapped.dtype), str(swapped.device))
+        decision = smoke_decision(correct_report, swapped_report, correct_stats)
         metrics = {
             "formal_prediction": "correct_old_new.positive_prediction",
             "sign_and_order_are_diagnostics_only": True,
             "gt_motion_threshold_pixels": MOTION_THRESHOLD_PIXELS,
-            "correct_old_new": signed_metric_report(correct_native, ground_truth, motion_mask),
-            "swapped_old_new": signed_metric_report(swapped_native, ground_truth, motion_mask),
+            "valid_pixel_count": int(np.count_nonzero(valid_mask)),
+            "motion_pixel_count": int(np.count_nonzero(motion_mask)),
+            "correct_old_new": correct_report,
+            "swapped_old_new": swapped_report,
+            "prediction_statistics": {"correct_old_new": correct_stats, "swapped_old_new": swapped_stats},
+            "model_output_contract": {
+                "correct": {"shape": list(correct.shape), "dtype": str(correct.dtype),
+                            "device": str(correct.device), "finite": bool(correct.isfinite().all().item())},
+                "swapped": {"shape": list(swapped.shape), "dtype": str(swapped.dtype),
+                            "device": str(swapped.device), "finite": bool(swapped.isfinite().all().item())},
+            },
             "prediction_magnitude": {
                 "background_mean": float(np.mean(np.linalg.norm(correct_native[~motion_mask].astype(np.float64), axis=-1)))
                 if np.any(~motion_mask) else None,
@@ -555,10 +807,15 @@ def main(argv: list[str] | None = None) -> int:
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
         } if device.type == "cuda" else {"peak_allocated_bytes": None, "peak_reserved_bytes": None}
         metrics["peak_cuda_memory"] = peak_cuda
+        metrics["decision"] = decision
 
-        np.savez_compressed(output_dir / "predicted_flow_native.npz", flow=correct_native.astype(np.float32))
-        save_qualitative(output_dir / "flow_qualitative.png", source_rgb, target_rgb,
-                         correct_native, ground_truth)
+        np.savez_compressed(output_dir / "prediction.npz",
+                            flow=correct_native.astype(np.float32),
+                            swapped_flow=swapped_native.astype(np.float32),
+                            valid_mask=valid_mask,
+                            motion_mask=motion_mask)
+        save_qualitative(output_dir / "qualitative.png", source_rgb, target_rgb,
+                         old_events, new_events, correct_native, ground_truth)
         eventdelta_revision = git_head(REPOSITORY_ROOT)
         cudnn_version = torch.backends.cudnn.version() if hasattr(torch.backends, "cudnn") else None
         gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else None
@@ -569,7 +826,9 @@ def main(argv: list[str] | None = None) -> int:
                 capture_output=True, check=False).stdout.strip()),
             "eraft_commit": git_head(eraft_root),
             "checkpoint_sha256": sha256_file(checkpoint),
+            "checkpoint_load": checkpoint_load,
             "python": platform.python_version(),
+            "numpy": np.__version__,
             "torch": torch.__version__,
             "cuda_runtime": torch.version.cuda,
             "cudnn": cudnn_version,
@@ -581,14 +840,51 @@ def main(argv: list[str] | None = None) -> int:
             "saved_output_shape": list(correct_native.shape),
             "peak_cuda_memory": peak_cuda,
         }
-        config["status"] = "complete"
+        try:
+            import torchvision
+            environment["torchvision"] = torchvision.__version__
+        except ImportError:
+            environment["torchvision"] = None
+        config["status"] = decision["status"]
         atomic_write_json(output_dir / "config.json", config)
         atomic_write_json(output_dir / "environment.json", environment)
         atomic_write_json(output_dir / "metrics.json", metrics)
-        print(json_dumps({"status": "complete", "metrics": metrics,
+        write_summary(output_dir / "summary.md", config, metrics)
+        print(json_dumps({"status": decision["status"], "metrics": metrics,
                           "environment": environment}), flush=True)
         return 0
     except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
+        error = {"type": type(exc).__name__, "message": str(exc)}
+        config["status"] = "blocked"
+        config["blocked_error"] = error
+        atomic_write_json(output_dir / "config.json", config)
+        atomic_write_json(output_dir / "metrics.json", {"decision": {"status": "blocked",
+                                                                       "reasons": ["runtime_or_interface_error"]},
+                                                          "error": error})
+        environment_path = output_dir / "environment.json"
+        if not environment_path.exists():
+            blocked_environment: dict[str, Any] = {
+                "python": platform.python_version(),
+                "numpy": np.__version__,
+                "eraft_commit": None,
+                "checkpoint_sha256": None,
+                "numpy_global_monkey_patch": False,
+                "status": "blocked_before_environment_capture_completed",
+            }
+            try:
+                blocked_environment["eraft_commit"] = git_head(eraft_root)
+            except (OSError, RuntimeError):
+                pass
+            try:
+                blocked_environment["checkpoint_sha256"] = sha256_file(checkpoint)
+            except OSError:
+                pass
+            atomic_write_json(environment_path, blocked_environment)
+        (output_dir / "summary.md").write_text(
+            "# R3a E-RAFT/SEVD smoke summary\n\n"
+            f"- Status: **blocked**\n- Error: `{type(exc).__name__}: {exc}`\n",
+            encoding="utf-8",
+        )
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 2
 

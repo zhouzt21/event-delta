@@ -122,3 +122,28 @@ R2b 只有在保留 R2a 原有条件的同时，overall、fixed-3、fixed-4 的 
 - 启动时 `config.json` 和 stdout 会记录 selected device、CUDA availability 与 `CUDA_VISIBLE_DEVICES`；模型加载和首次 feature 提取后继续记录 model parameter、processor tensor 和 feature device，以及 feature stage/grid/shape。选择 CUDA 时任何核心 tensor 留在 CPU 都会立即报错。
 - 首次运行到第一步 warp 前的长 CPU-only 区间来自两个串行阶段：low/mid/high window selection 会读取并解压全部 stride-aligned candidate window 的 flow NPZ；随后 `from_pretrained` 先反序列化模型，再由显式 `.to(selected_device)` 移动模型。目录扫描只枚举文件名，feature warp 尚未开始，单张图片 processor 也不是主要的全数据遍历。旧代码硬编码 CUDA，因此并没有有意的 CPU fallback，但缺少日志，无法从外部区分这些阶段；现在会分别显示 `resolving recordings`、`sampling windows`、`loading processor/model` 和各阶段耗时，并对实际 tensor device 做断言。
 - 纯 ViT latency 不包含磁盘读取或 processor；CUDA 模式用 CUDA events，并在测量前后 synchronize。CPU 模式使用 `perf_counter`，不会调用 CUDA synchronize。
+
+## R3a：单 transition E-RAFT/SEVD smoke test
+
+R3a 只验证 Event-derived flow 的接口、方向与尺度，不比较 VLM accuracy，也不改动 R2 oracle 结果。工具动态导入固定 commit 的外部 E-RAFT checkout，严格加载服务器已有 `dsec.tar`，不下载数据、代码或 checkpoint。正式输入映射固定为 `Event_i`（old）+ `Event_{i+1}`（new），预测 `i -> i+1`，只用 `flow_i` 作为 oracle 评价。
+
+```bash
+conda activate eraft
+CUDA_VISIBLE_DEVICES=0 python tools/smoke_eraft_sevd.py \
+  --root "$SEVD_ROOT" \
+  --recording fixed-3 \
+  --source-frame-id "$SOURCE_FRAME_ID" \
+  --eraft-root "$ERAFT_ROOT" \
+  --checkpoint "$ERAFT_CHECKPOINT" \
+  --bins 15 \
+  --input-height 480 \
+  --input-width 640 \
+  --iterations 12 \
+  --mode standard \
+  --device cuda \
+  --output-dir artifacts/r3a_eraft_smoke
+```
+
+成功完成接口运行后，输出 `config.json`、`environment.json`、`metrics.json`、`prediction.npz`、`qualitative.png` 和 `summary.md`。`prediction.npz` 的正式 `flow` 始终是正确 packet 顺序和正号的原生 1280×960 pixel displacement；负号及 swapped-event 只作诊断，绝不自动替换正式结果。
+
+本 smoke 只有在 checkpoint strict load、输入输出 shape/finite/尺度正确、预测非全零、正号明显优于负号且正确顺序明显优于 swapped 时才标记 `passed`。否则写出 `blocked` 与原因；这表示接口、方向或单样本诊断尚未通过，不代表正式 E-RAFT 泛化结论。timestamp 单位、Event 区间归属、flow GT 解码仍沿用 R1.2/R3a audit 的既有边界，不在本轮重新论证。

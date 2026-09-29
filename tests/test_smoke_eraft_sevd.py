@@ -1,3 +1,4 @@
+import json
 from collections import OrderedDict
 from pathlib import Path
 
@@ -6,12 +7,19 @@ import pytest
 from PIL import Image
 
 from tools.smoke_eraft_sevd import (
+    checkpoint_prefix_action,
     normalize_state_dict_prefix,
+    prediction_statistics,
+    read_sevd_events,
     require_prediction,
     resize_prediction_native,
     resolve_transition_paths,
+    signed_metric_report,
+    smoke_decision,
+    validate_events,
     voxelize_events,
 )
+from src.event_delta.json_io import atomic_write_json
 
 
 EVENT_DTYPE = np.dtype([("x", "<u2"), ("y", "<u2"), ("t", "<i8"), ("pol", "?")])
@@ -33,6 +41,9 @@ def test_voxelization_trilinear_sign_timestamp_and_nonzero_normalization():
     assert stats["timestamp_span"] == 3
     assert stats["positive_event_count"] == 2
     assert stats["negative_event_count"] == 1
+    assert stats["coordinate_scale_xy"] == [0.5, 0.5]
+    assert stats["polarity_mapping"] == {"False": -1.0, "True": 1.0}
+    assert stats["voxel_finite"] is True
     raw = np.zeros((15, 2, 2), dtype=np.float32)
     raw[0, 0, 0] = 1
     raw[14, 0, 0] = 1
@@ -73,10 +84,30 @@ def write_event(path: Path):
     np.savez(path, dvs_events=events)
 
 
+def test_structured_event_schema_validation_and_bounds(tmp_path):
+    path = tmp_path / "41-xytp.npz"
+    write_event(path)
+    events = read_sevd_events(path)
+    stats = validate_events(events, path, source_hw=(2, 3))
+    assert stats["fields"] == {"x": "uint16", "y": "uint16", "t": "int64", "pol": "bool"}
+    assert stats["timestamp_span"] == 1
+    bad_schema = tmp_path / "bad-xytp.npz"
+    np.savez(bad_schema, x=np.array([0]), y=np.array([0]), t=np.array([1]), pol=np.array([True]))
+    with pytest.raises(ValueError, match="dvs_events"):
+        read_sevd_events(bad_schema)
+    non_monotonic = packet([0, 0, 0], [0, 0, 0], [1, 3, 2], [True, False, True])
+    with pytest.raises(ValueError, match="monotonic"):
+        validate_events(non_monotonic, path, source_hw=(2, 3))
+    out_of_bounds = packet([0, 3], [0, 1], [1, 2], [True, False])
+    with pytest.raises(ValueError, match="bounds"):
+        validate_events(out_of_bounds, path, source_hw=(2, 3))
+
+
 def test_pair_resolution_uses_event_i_event_i_plus_one_and_flow_i(tmp_path):
     recording = tmp_path / "extracted" / "fixed-3-archive"
     write_event(recording / "dvs_camera" / "41-xytp.npz")
     write_event(recording / "dvs_camera" / "42-xytp.npz")
+    np.savez(recording / "dvs_camera" / "41-unrelated.npz", ignored=np.zeros(1))
     (recording / "optical_flow_camera").mkdir(parents=True)
     np.savez(recording / "optical_flow_camera" / "41.npz", flow=np.zeros((2, 3, 2), np.float32))
     (recording / "rgb_camera").mkdir(parents=True)
@@ -107,6 +138,8 @@ def test_prefix_normalization_accepts_only_exact_or_uniform_module_prefix():
     assert set(normalize_state_dict_prefix(exact, {"a", "b"})) == {"a", "b"}
     prefixed = OrderedDict((f"module.{key}", object()) for key in ("a", "b"))
     assert set(normalize_state_dict_prefix(prefixed, {"a", "b"})) == {"a", "b"}
+    assert checkpoint_prefix_action(exact, {"a", "b"}) == "none"
+    assert checkpoint_prefix_action(prefixed, {"a", "b"}) == "stripped_uniform_module_prefix"
     with pytest.raises(ValueError, match="mixes"):
         normalize_state_dict_prefix({"module.a": 1, "b": 2}, {"a", "b"})
     with pytest.raises(ValueError, match="strictly match"):
@@ -122,3 +155,27 @@ def test_shape_and_finite_guard():
     bad[0, 0, 0, 0] = float("nan")
     with pytest.raises(ValueError, match="NaN or Inf"):
         require_prediction(bad)
+
+
+def test_reversed_prediction_is_diagnostic_and_never_selected():
+    ground_truth = np.zeros((2, 3, 2), dtype=np.float32)
+    ground_truth[..., 0] = 2.0
+    motion = np.ones((2, 3), dtype=bool)
+    correct = signed_metric_report(ground_truth, ground_truth, motion)
+    swapped = signed_metric_report(-ground_truth, ground_truth, motion)
+    statistics = prediction_statistics(ground_truth)
+    passed = smoke_decision(correct, swapped, statistics)
+    assert passed["status"] == "passed"
+    assert passed["formal_prediction_changed"] is False
+    reversed_formal = smoke_decision(swapped, correct, statistics)
+    assert reversed_formal["status"] == "blocked"
+    assert "positive_sign_not_clearly_better_than_negative" in reversed_formal["reasons"]
+
+
+def test_smoke_json_accepts_numpy_scalars(tmp_path):
+    destination = tmp_path / "metrics.json"
+    atomic_write_json(destination, {"count": np.int64(7), "score": np.float32(1.5),
+                                    "finite": np.bool_(True)})
+    assert json.loads(destination.read_text(encoding="utf-8")) == {
+        "count": 7, "score": 1.5, "finite": True,
+    }
