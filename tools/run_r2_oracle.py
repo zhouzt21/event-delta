@@ -28,6 +28,7 @@ from event_delta.flow_warp import (  # noqa: E402
     sevd_flow_to_feature_displacement,
     sevd_flow_to_pixel_displacement,
 )
+from event_delta.json_io import atomic_write_json, json_dumps  # noqa: E402
 from event_delta.metrics import compare_stale_and_propagated, summarize_by_offset  # noqa: E402
 from event_delta.qwen_features import (  # noqa: E402
     ProbeError,
@@ -403,10 +404,8 @@ def main(argv: list[str] | None = None) -> int:
         "feature_grid": None,
         "feature_shape": None,
     }
-    print(json.dumps(startup_runtime, ensure_ascii=False), flush=True)
-    (output_dir / "config.json").write_text(json.dumps({"status": "starting", "runtime": startup_runtime},
-                                                        indent=2, ensure_ascii=False) + "\n",
-                                             encoding="utf-8")
+    print(json_dumps(startup_runtime), flush=True)
+    atomic_write_json(output_dir / "config.json", {"status": "starting", "runtime": startup_runtime})
     per_recording_count = args.windows // len(args.recording)
     indexes, selected = {}, []
     phase_start = time.perf_counter()
@@ -457,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                             "target_rgb": "offline dense-feature ground truth only",
                             "target_feature_hole_filling": False},
               "profiling": {"warmup": args.profile_warmup, "repeats": args.profile_repeats}}
-    (output_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    atomic_write_json(output_dir / "config.json", config)
 
     first_window = selected[0]
     first_image = indexes[first_window["recording"]]["rgb"][first_window["anchor_frame_id"]]
@@ -471,12 +470,11 @@ def main(argv: list[str] | None = None) -> int:
         probe_feature, probe = extractor.encode_inputs(probe_inputs, args.feature_stage)
         runtime = extractor.runtime_diagnostics(probe_inputs, probe_feature, args.feature_stage)
         config["runtime"] = runtime
-        (output_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n",
-                                                 encoding="utf-8")
-        print(json.dumps(runtime, ensure_ascii=False), flush=True)
+        atomic_write_json(output_dir / "config.json", config)
+        print(json_dumps(runtime), flush=True)
         probe.update(model=args.model, image=str(first_image), local_files_only=args.local_files_only,
                      git_commit=revision, runtime=runtime)
-        probe_path.write_text(json.dumps(probe, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        atomic_write_json(probe_path, probe)
         if probe["token_order"]["status"] != "confirmed_from_installed_source":
             raise TokenOrderError(probe["token_order"]["warning"])
     except (ProbeError, OSError, ValueError) as exc:
@@ -486,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
             existing = json.loads(probe_path.read_text(encoding="utf-8"))
             existing.update(blocked)
             blocked = existing
-        probe_path.write_text(json.dumps(blocked, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        atomic_write_json(probe_path, blocked)
         print(f"blocked: {exc}; wrote {probe_path}", file=sys.stderr)
         return 2
 
@@ -541,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
                              "flow_original_height": raw_numpy.shape[0],
                              "flow_original_width": raw_numpy.shape[1],
                              "step_coverage_ratio": coverage,
-                             "coverage_history": json.dumps(coverage_history), **metrics})
+                             "coverage_history": json_dumps(coverage_history), **metrics})
                 if qualitative is None and offset == args.max_offset:
                     qualitative = {"recording": recording, "anchor": anchor, "offset": offset,
                                    "stale": stale_numpy, "propagated": propagated_numpy,
@@ -562,12 +560,12 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(output_dir / "window_summary.csv", windows)
     efficiency = profile_efficiency(extractor, first_image, args.feature_stage, representative_feature,
                                     representative_displacement, args.profile_warmup, args.profile_repeats)
-    (output_dir / "efficiency.json").write_text(json.dumps(efficiency, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output_dir / "efficiency.json", efficiency)
     decision = evaluate_criteria(rows, offset_summary, efficiency, args.minimum_coverage,
                                  args.maximum_warp_vision_ratio)
     results = {"offset_summary": offset_summary, "decision": decision}
     config["results"] = results
-    (output_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    atomic_write_json(output_dir / "config.json", config)
     plot_metrics(offset_summary, output_dir)
     if qualitative is None:
         raise RuntimeError("no qualitative example was produced")

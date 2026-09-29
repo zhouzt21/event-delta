@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -13,6 +12,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
+from event_delta.json_io import atomic_write_json, json_dumps  # noqa: E402
 from event_delta.qwen_features import (  # noqa: E402
     ProbeError,
     QwenVisionExtractor,
@@ -50,24 +50,24 @@ def main(argv: list[str] | None = None) -> int:
                            "torch_cuda_is_available": bool(torch.cuda.is_available()),
                            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
         report["runtime"] = startup_runtime
-        output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(json.dumps(startup_runtime, ensure_ascii=False), flush=True)
+        atomic_write_json(output, report)
+        print(json_dumps(startup_runtime), flush=True)
         print("loading processor/model", flush=True)
         extractor = QwenVisionExtractor(args.model, args.local_files_only, args.device)
         inputs = extractor.preprocess(args.image)
         feature, details = extractor.encode_inputs(inputs, "post_merger")
         details["runtime"] = extractor.runtime_diagnostics(inputs, feature, "post_merger")
         report.update(details)
-        print(json.dumps(details["runtime"], ensure_ascii=False), flush=True)
+        print(json_dumps(details["runtime"]), flush=True)
         if report["token_order"]["status"] != "confirmed_from_installed_source":
             raise TokenOrderError(report["token_order"]["warning"])
     except (ProbeError, OSError, ValueError) as exc:
         report.update(status="blocked", error=f"{type(exc).__name__}: {exc}",
                       stop_reason="feature propagation was not attempted")
-        output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        atomic_write_json(output, report)
         print(f"blocked: {exc}; wrote {output}", file=sys.stderr)
         return 2
-    output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    atomic_write_json(output, report)
     print(f"wrote {output}")
     return 0
 
