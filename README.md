@@ -1,6 +1,6 @@
 # event-delta
 
-目标：验证低频 RGB 语义锚点与连续 Event 状态增量能否以较低成本改善流式 VLM 在任意查询时刻的状态与回答。当前仍处于数据约定验证阶段，不涉及 Qwen、VLM、feature/token propagation 或训练。
+目标：验证低频 RGB 语义锚点与连续 Event 状态增量能否以较低成本改善流式 VLM 在任意查询时刻的状态与回答。R1/R1.2 负责数据约定验证；R2a 只做 Qwen vision feature 与 GT-flow oracle propagation 的最小 kill test，不涉及训练、LLM generation/QA 或 Event encoder。
 
 ## R1/R1.1：SEVD 静态审计
 
@@ -44,3 +44,45 @@ python tools/calibrate_sevd.py \
 Event 的 integer timestamp unit `≈ ns` 只是存储数值尺度推断，不代表 1 GHz perception。一个 Event packet 约覆盖 100 ms，即 10 Hz。首个实验计划仍是 **1 Hz RGB anchor + 10 Hz Event delta**；中间 RGB 只作为 offline ground truth，不能作为查询时刻之前不可用的在线输入。
 
 R1.2 只验证数据的时空约定，不验证 Event state delta 的核心研究假设，也不宣称结构化状态已经节省 vision encoder。KITTI boxes/IDs 与 flow 在这里属于 oracle 校准证据。
+
+## R2a：Qwen visual feature + GT-flow oracle propagation smoke test
+
+R2a 是 feature propagation 路线的第一项 kill test：在 1 Hz RGB anchor 上只运行一次 Qwen vision encoder，用已确认方向和尺度的 SEVD GT flow recurrently forward-splat visual feature，并与 stale anchor feature 一起对照离线 dense-RGB feature ground truth。
+
+运行环境需要兼容 Qwen3-VL 的 `torch`、`transformers`，以及 `numpy`、Pillow、`matplotlib`。工具不会自动下载依赖或模型；`--local-files-only` 会强制只使用服务器已有缓存。
+
+先对一张 RGB 做结构与 token-order probe：
+
+```bash
+mkdir -p artifacts/r2
+python tools/probe_qwen_vision.py \
+  --model Qwen/Qwen3-VL-2B-Instruct \
+  --image /path/to/one/rgb.png \
+  --output artifacts/r2/probe.json \
+  --local-files-only
+```
+
+probe 使用 BF16、SDPA、eval 和 inference mode，只运行 vision module。它通过实际模块结构和 hooks 记录 last vision block、merger 前后 feature、最终 visual tokens、grid/token 一致性和安装版本源码中的 token-order 证据。若源码不能可靠证明二维 grid 顺序，状态为 `blocked`，不会猜测 row-major 后继续。
+
+运行 6-window oracle smoke test：
+
+```bash
+mkdir -p artifacts/r2_smoke
+python tools/run_r2_oracle.py \
+  --root "$SEVD_ROOT" \
+  --recording fixed-3 \
+  --recording fixed-4 \
+  --model Qwen/Qwen3-VL-2B-Instruct \
+  --windows 6 \
+  --anchor-stride 10 \
+  --max-offset 9 \
+  --seed 20260929 \
+  --output-dir artifacts/r2_smoke \
+  --local-files-only
+```
+
+每条 recording 自动按 9-step window 的 GT-flow mean pixel activity 选择 low/mid/high 三个窗口。默认比较 post-merger feature；只有 probe 确认 pre-merger merge-blocked 顺序可逆时，才可显式使用 `--feature-stage pre_merger`。
+
+输出为 `probe.json`、`config.json`、`per_offset_metrics.csv`、`window_summary.csv`、`efficiency.json`、`summary.md`、`distance_vs_offset.png`、`recovery_vs_offset.png` 和 `qualitative_features.png`。其中 target RGB 只用于 offline dense-feature ground truth；stale/propagated 方法路径不会用 target feature 填补 splatting holes。
+
+GT flow 是 oracle，不是最终 Event 方法。该 smoke test 只回答“避免重复 ViT 是否可能省计算”，不代表 Event encoder 的最终成本；它不运行 LLM generation/QA、不训练模型，也不实现 Event encoder、E-RAFT 或 EventFlash。只有 motion-token cosine distance 改善、offset 3/5/9 多数获胜、改善不只来自固定背景、coverage 足够且 warp 显著快于 vision encode 时，才标记为 `promising`。否则先检查 feature stage、grid ordering 和 warp validity；若三者正确，则记录 kill result 并停止传播路线。
