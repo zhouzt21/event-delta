@@ -81,12 +81,24 @@ def sevd_flow_to_feature_displacement(flow: Any, feature_hw: tuple[int, int],
 
 
 def _validate_feature_inputs(features: Any, displacement: Any, confidence: Any | None) -> None:
-    if len(features.shape) != 3:
-        raise ValueError(f"expected HxWxC features, got {tuple(features.shape)}")
-    if tuple(displacement.shape) != (*tuple(features.shape[:2]), 2):
-        raise ValueError(f"displacement shape {tuple(displacement.shape)} does not match feature grid")
-    if confidence is not None and tuple(confidence.shape) != tuple(features.shape[:2]):
-        raise ValueError("confidence shape does not match feature grid")
+    feature_shape = tuple(features.shape)
+    displacement_shape = tuple(displacement.shape)
+    confidence_shape = None if confidence is None else tuple(confidence.shape)
+    if len(feature_shape) != 3:
+        raise ValueError(f"feature contract requires [H,W,C], got {feature_shape}")
+    expected_displacement = (*feature_shape[:2], 2)
+    if displacement_shape != expected_displacement:
+        raise ValueError(f"displacement contract requires {expected_displacement}, got {displacement_shape}; "
+                         f"feature={feature_shape}")
+    if confidence is not None and confidence_shape != feature_shape[:2]:
+        raise ValueError(f"confidence contract requires {feature_shape[:2]}, got {confidence_shape}; "
+                         f"feature={feature_shape}")
+
+
+def _require_shape(name: str, value: Any, expected: tuple[int, ...]) -> None:
+    actual = tuple(value.shape)
+    if actual != expected:
+        raise ValueError(f"{name} contract requires shape {expected}, got {actual}")
 
 
 def forward_splat_numpy(features: np.ndarray, displacement: np.ndarray,
@@ -127,19 +139,27 @@ def forward_splat_numpy(features: np.ndarray, displacement: np.ndarray,
 
 
 def forward_splat_torch(features: Any, displacement: Any, confidence: Any | None = None) -> tuple[Any, Any, Any]:
-    """CUDA-compatible forward bilinear splat using scatter_add_."""
+    """Forward splat [H,W,C] features using [H,W,2] motion and [H,W] confidence."""
     import torch
     _validate_feature_inputs(features, displacement, confidence)
     height, width, channels = features.shape
+    if displacement.device != features.device:
+        raise ValueError(f"feature/displacement device mismatch: {features.device} vs {displacement.device}")
+    if confidence is not None and confidence.device != features.device:
+        raise ValueError(f"feature/confidence device mismatch: {features.device} vs {confidence.device}")
     work_dtype = torch.float32
     values = features.to(work_dtype)
     motion = displacement.to(work_dtype)
     confidence = (torch.ones((height, width), dtype=work_dtype, device=features.device)
                   if confidence is None else confidence.to(work_dtype))
+    _require_shape("work feature", values, (height, width, channels))
+    _require_shape("work displacement", motion, (height, width, 2))
+    _require_shape("work confidence", confidence, (height, width))
     yy, xx = torch.meshgrid(torch.arange(height, device=features.device, dtype=work_dtype),
                             torch.arange(width, device=features.device, dtype=work_dtype), indexing="ij")
     tx, ty = xx + motion[..., 0], yy + motion[..., 1]
     finite = torch.isfinite(tx) & torch.isfinite(ty) & torch.isfinite(confidence) & (confidence > 0)
+    _require_shape("valid source mask", finite, (height, width))
     floor_x, floor_y = torch.floor(torch.where(finite, tx, torch.zeros_like(tx))), torch.floor(
         torch.where(finite, ty, torch.zeros_like(ty)))
     fraction_x, fraction_y = tx - floor_x, ty - floor_y
@@ -153,19 +173,29 @@ def forward_splat_torch(features: Any, displacement: Any, confidence: Any | None
     )
     flat_values = values.reshape(-1, channels)
     for x_target, y_target, bilinear in neighbors:
+        _require_shape("neighbor bilinear weight", bilinear, (height, width))
         x_long, y_long = x_target.long(), y_target.long()
         valid = finite & (x_long >= 0) & (x_long < width) & (y_long >= 0) & (y_long < height)
         contribution = bilinear * confidence
+        _require_shape("neighbor contribution", contribution, (height, width))
         valid &= contribution > 0
+        _require_shape("neighbor valid mask", valid, (height, width))
         indices = (y_long[valid] * width + x_long[valid]).reshape(-1)
         weights.scatter_add_(0, indices, contribution[valid])
+        selected_contribution = contribution[valid][:, None]
+        _require_shape("selected neighbor contribution", selected_contribution, (indices.numel(), 1))
         numerator.scatter_add_(0, indices[:, None].expand(-1, channels),
-                               flat_values[valid.reshape(-1)] * contribution[valid, None])
+                               flat_values[valid.reshape(-1)] * selected_contribution)
     valid_target = weights > 1e-8
     output = torch.zeros_like(numerator)
     output[valid_target] = numerator[valid_target] / weights[valid_target, None]
     propagated_confidence = weights.clamp(0, 1).reshape(height, width)
-    return output.reshape(height, width, channels).to(features.dtype), valid_target.reshape(height, width), propagated_confidence
+    output = output.reshape(height, width, channels).to(features.dtype)
+    valid_target = valid_target.reshape(height, width)
+    _require_shape("output feature", output, (height, width, channels))
+    _require_shape("output valid mask", valid_target, (height, width))
+    _require_shape("output confidence", propagated_confidence, (height, width))
+    return output, valid_target, propagated_confidence
 
 
 def forward_splat(features: Any, displacement: Any, confidence: Any | None = None) -> tuple[Any, Any, Any]:

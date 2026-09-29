@@ -1,8 +1,10 @@
 import numpy as np
+import pytest
 
 from src.event_delta.flow_warp import (
     SEVD_BACKGROUND,
     forward_splat_numpy,
+    forward_splat_torch,
     pixel_to_feature_displacement,
     recurrent_forward_splat,
     sevd_flow_to_feature_displacement,
@@ -65,3 +67,50 @@ def test_confidence_masks_invalid_sources():
     assert not valid[1, 1]
     assert output_confidence[1, 1] == 0
     np.testing.assert_allclose(propagated[valid], features[valid])
+
+
+def test_shape_contract_rejects_old_30x1x40_broadcast_shape():
+    features = np.zeros((30, 40, 3), dtype=np.float32)
+    displacement = np.zeros((30, 40, 2), dtype=np.float32)
+    bad_confidence = np.zeros((30, 1, 40), dtype=np.float32)
+    with pytest.raises(ValueError, match=r"requires \(30, 40\), got \(30, 1, 40\)"):
+        forward_splat_numpy(features, displacement, bad_confidence)
+
+
+def test_torch_non_square_30x40_shape_contract_and_nine_recurrent_steps():
+    """Regression for contribution[valid, None] producing [30,1,40]."""
+    torch = pytest.importorskip("torch")
+    height, width, channels = 30, 40, 3
+    features = torch.arange(height * width * channels, dtype=torch.float32).reshape(height, width, channels)
+    confidence = torch.ones((height, width), dtype=torch.float32)
+    zero = torch.zeros((height, width, 2), dtype=torch.float32)
+
+    identity, valid, output_confidence = forward_splat_torch(features, zero, confidence)
+    assert identity.shape == (height, width, channels)
+    assert valid.shape == output_confidence.shape == (height, width)
+    assert torch.equal(identity, features)
+    assert valid.all() and torch.isfinite(identity).all() and torch.isfinite(output_confidence).all()
+
+    horizontal = zero.clone()
+    horizontal[..., 0] = 1
+    shifted_x, valid_x, confidence_x = forward_splat_torch(features, horizontal, confidence)
+    assert shifted_x.shape == (height, width, channels)
+    assert valid_x.shape == confidence_x.shape == (height, width)
+    assert torch.equal(shifted_x[:, 1:], features[:, :-1])
+    assert not valid_x[:, 0].any() and valid_x[:, 1:].all()
+
+    vertical = zero.clone()
+    vertical[..., 1] = 1
+    shifted_y, valid_y, confidence_y = forward_splat_torch(features, vertical, confidence)
+    assert shifted_y.shape == (height, width, channels)
+    assert valid_y.shape == confidence_y.shape == (height, width)
+    assert torch.equal(shifted_y[1:], features[:-1])
+    assert not valid_y[0].any() and valid_y[1:].all()
+
+    recurrent, recurrent_valid, coverage, recurrent_confidence = recurrent_forward_splat(
+        features, [horizontal] * 9, confidence)
+    assert recurrent.shape == (height, width, channels)
+    assert recurrent_valid.shape == recurrent_confidence.shape == (height, width)
+    assert len(coverage) == 9
+    assert torch.isfinite(recurrent).all() and torch.isfinite(recurrent_confidence).all()
+    assert torch.equal(recurrent[:, 9:], features[:, :-9])

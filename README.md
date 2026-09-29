@@ -78,6 +78,7 @@ python tools/run_r2_oracle.py \
   --max-offset 9 \
   --seed 20260929 \
   --output-dir artifacts/r2_smoke \
+  --device auto \
   --local-files-only
 ```
 
@@ -86,3 +87,10 @@ python tools/run_r2_oracle.py \
 输出为 `probe.json`、`config.json`、`per_offset_metrics.csv`、`window_summary.csv`、`efficiency.json`、`summary.md`、`distance_vs_offset.png`、`recovery_vs_offset.png` 和 `qualitative_features.png`。其中 target RGB 只用于 offline dense-feature ground truth；stale/propagated 方法路径不会用 target feature 填补 splatting holes。
 
 GT flow 是 oracle，不是最终 Event 方法。该 smoke test 只回答“避免重复 ViT 是否可能省计算”，不代表 Event encoder 的最终成本；它不运行 LLM generation/QA、不训练模型，也不实现 Event encoder、E-RAFT 或 EventFlash。只有 motion-token cosine distance 改善、offset 3/5/9 多数获胜、改善不只来自固定背景、coverage 足够且 warp 显著快于 vision encode 时，才标记为 `promising`。否则先检查 feature stage、grid ordering 和 warp validity；若三者正确，则记录 kill result 并停止传播路线。
+
+### R2 troubleshooting
+
+- `--device auto` 在 `torch.cuda.is_available()` 为 true 时选择 CUDA，否则明确选择 CPU；可用 `--device cuda` 强制要求 CUDA，CUDA 不可用时会在目录扫描和窗口采样前立即失败，不会静默回退。
+- 启动时 `config.json` 和 stdout 会记录 selected device、CUDA availability 与 `CUDA_VISIBLE_DEVICES`；模型加载和首次 feature 提取后继续记录 model parameter、processor tensor 和 feature device，以及 feature stage/grid/shape。选择 CUDA 时任何核心 tensor 留在 CPU 都会立即报错。
+- 首次运行到第一步 warp 前的长 CPU-only 区间来自两个串行阶段：low/mid/high window selection 会读取并解压全部 stride-aligned candidate window 的 flow NPZ；随后 `from_pretrained` 先反序列化模型，再由显式 `.to(selected_device)` 移动模型。目录扫描只枚举文件名，feature warp 尚未开始，单张图片 processor 也不是主要的全数据遍历。旧代码硬编码 CUDA，因此并没有有意的 CPU fallback，但缺少日志，无法从外部区分这些阶段；现在会分别显示 `resolving recordings`、`sampling windows`、`loading processor/model` 和各阶段耗时，并对实际 tensor device 做断言。
+- 纯 ViT latency 不包含磁盘读取或 processor；CUDA 模式用 CUDA events，并在测量前后 synchronize。CPU 模式使用 `perf_counter`，不会调用 CUDA synchronize。

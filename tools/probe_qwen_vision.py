@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,13 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from event_delta.qwen_features import ProbeError, QwenVisionExtractor, TokenOrderError  # noqa: E402
+from event_delta.qwen_features import (  # noqa: E402
+    ProbeError,
+    QwenVisionExtractor,
+    TokenOrderError,
+    require_runtime,
+    select_device_name,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -21,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--local-files-only", action="store_true")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     return parser.parse_args(argv)
 
 
@@ -37,9 +44,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.image.is_file():
             raise ProbeError(f"image does not exist: {args.image}")
+        torch, _transformers = require_runtime()
+        startup_runtime = {"requested_device": args.device,
+                           "selected_device": select_device_name(args.device, bool(torch.cuda.is_available())),
+                           "torch_cuda_is_available": bool(torch.cuda.is_available()),
+                           "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+        report["runtime"] = startup_runtime
+        output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(json.dumps(startup_runtime, ensure_ascii=False), flush=True)
+        print("loading processor/model", flush=True)
         extractor = QwenVisionExtractor(args.model, args.local_files_only, args.device)
-        details = extractor.probe_image(args.image)
+        inputs = extractor.preprocess(args.image)
+        feature, details = extractor.encode_inputs(inputs, "post_merger")
+        details["runtime"] = extractor.runtime_diagnostics(inputs, feature, "post_merger")
         report.update(details)
+        print(json.dumps(details["runtime"], ensure_ascii=False), flush=True)
         if report["token_order"]["status"] != "confirmed_from_installed_source":
             raise TokenOrderError(report["token_order"]["warning"])
     except (ProbeError, OSError, ValueError) as exc:

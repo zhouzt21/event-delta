@@ -24,6 +24,18 @@ class TokenOrderError(ProbeError):
     """The installed source does not prove a reversible 2D token order."""
 
 
+def select_device_name(requested: str, cuda_available: bool) -> str:
+    if requested not in {"auto", "cuda", "cpu"}:
+        raise ProbeError(f"device must be auto, cuda, or cpu; got {requested!r}")
+    if requested == "cuda":
+        if not cuda_available:
+            raise ProbeError("--device cuda was requested, but torch.cuda.is_available() is false")
+        return "cuda"
+    if requested == "auto":
+        return "cuda" if cuda_available else "cpu"
+    return "cpu"
+
+
 def require_runtime() -> tuple[Any, Any]:
     try:
         import torch
@@ -219,10 +231,9 @@ def tokens_to_grid(tokens: Any, grid_thw: Any, merge_size: int, stage: str, orde
 class QwenVisionExtractor:
     """Load a Qwen model and expose vision features without invoking its language model."""
 
-    def __init__(self, model_name: str, local_files_only: bool = False, device: str = "cuda") -> None:
+    def __init__(self, model_name: str, local_files_only: bool = False, device: str = "auto") -> None:
         torch, transformers = require_runtime()
-        if device.startswith("cuda") and not torch.cuda.is_available():
-            raise ProbeError("CUDA is required for the BF16 Qwen R2 probe, but torch.cuda.is_available() is false")
+        selected_device = select_device_name(device, bool(torch.cuda.is_available()))
         auto_model = getattr(transformers, "AutoModelForImageTextToText", None)
         if auto_model is None:
             auto_model = getattr(transformers, "AutoModelForVision2Seq", None)
@@ -232,8 +243,11 @@ class QwenVisionExtractor:
         self.processor = transformers.AutoProcessor.from_pretrained(model_name, local_files_only=local_files_only)
         self.model = auto_model.from_pretrained(model_name, torch_dtype=torch.bfloat16,
                                                 attn_implementation="sdpa", local_files_only=local_files_only)
-        self.model.to(device).eval()
-        self.device = torch.device(device)
+        self.model.to(selected_device).eval()
+        self.requested_device = device
+        self.device = next(self.model.parameters()).device
+        if self.device.type != selected_device:
+            raise ProbeError(f"model device mismatch: selected={selected_device}, parameter={self.device}")
         self.structure = discover_vision_structure(self.model)
         self.order = analyze_token_order(self.structure["vision"], self.structure["merger"], self.processor)
         self.patch_size = config_value([self.structure["vision"], self.model.config], ("patch_size",))
@@ -244,6 +258,40 @@ class QwenVisionExtractor:
         patch_values = ([self.patch_size] if isinstance(self.patch_size, (int, float)) else self.patch_size or [])
         if not patch_values or any(float(value) <= 0 for value in patch_values) or self.merge_size <= 0:
             raise ProbeError("could not determine patch_size/spatial_merge_size from actual model configuration")
+
+    def move_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        moved = {key: (value.to(self.device) if isinstance(value, self.torch.Tensor) else value)
+                 for key, value in inputs.items()}
+        mismatches = {key: str(value.device) for key, value in moved.items()
+                      if isinstance(value, self.torch.Tensor) and value.device != self.device}
+        if mismatches:
+            raise ProbeError(f"processor tensor device mismatch: selected={self.device}, actual={mismatches}")
+        return moved
+
+    def runtime_diagnostics(self, inputs: dict[str, Any] | None = None, feature: Any | None = None,
+                            stage: str | None = None) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {
+            "requested_device": self.requested_device,
+            "selected_device": str(self.device),
+            "torch_cuda_is_available": bool(self.torch.cuda.is_available()),
+            "cuda_visible_devices": __import__("os").environ.get("CUDA_VISIBLE_DEVICES"),
+            "model_parameter_device": str(next(self.model.parameters()).device),
+        }
+        if inputs is not None:
+            diagnostics["input_tensor_devices"] = {
+                key: str(value.device) for key, value in inputs.items() if isinstance(value, self.torch.Tensor)}
+            diagnostics["input_tensor_device"] = str(inputs["pixel_values"].device)
+        if feature is not None:
+            diagnostics.update(extracted_feature_device=str(feature.device), feature_stage=stage,
+                               feature_grid=list(feature.shape[:2]), feature_shape=list(feature.shape))
+        core_devices = [diagnostics["model_parameter_device"]]
+        core_devices.extend(diagnostics.get("input_tensor_devices", {}).values())
+        if feature is not None:
+            core_devices.append(diagnostics["extracted_feature_device"])
+        mismatches = [actual for actual in core_devices if self.torch.device(actual) != self.device]
+        if mismatches:
+            raise ProbeError(f"core tensor device mismatch: selected={self.device}, actual={mismatches}")
+        return diagnostics
 
     def preprocess(self, image: Image.Image | Path) -> dict[str, Any]:
         if isinstance(image, Path):
@@ -261,7 +309,7 @@ class QwenVisionExtractor:
             self.preprocess_mode = "official processor with image-only chat placeholder"
         if "pixel_values" not in inputs or "image_grid_thw" not in inputs:
             raise ProbeError(f"processor output lacks pixel_values/image_grid_thw; keys={list(inputs.keys())}")
-        return inputs
+        return self.move_inputs(inputs)
 
     def _vision_forward(self, inputs: dict[str, Any]) -> dict[str, Any]:
         captured: dict[str, Any] = {}
@@ -278,8 +326,9 @@ class QwenVisionExtractor:
         handles = [self.structure["last_block"].register_forward_hook(block_hook),
                    self.structure["merger"].register_forward_pre_hook(merger_pre_hook),
                    self.structure["merger"].register_forward_hook(merger_hook)]
-        pixel_values = inputs["pixel_values"].to(device=self.device, dtype=self.torch.bfloat16)
-        grid_thw = inputs["image_grid_thw"].to(self.device)
+        inputs = self.move_inputs(inputs)
+        pixel_values = inputs["pixel_values"].to(dtype=self.torch.bfloat16)
+        grid_thw = inputs["image_grid_thw"]
         try:
             with self.torch.inference_mode():
                 parameters = inspect.signature(self.structure["vision"].forward).parameters
@@ -304,6 +353,11 @@ class QwenVisionExtractor:
                 handle.remove()
         if captured.get("pre_merger") is None or captured.get("post_merger") is None:
             raise ProbeError("vision hooks did not capture both pre- and post-merger tensors")
+        feature_devices = {key: str(value.device) for key, value in captured.items()
+                           if isinstance(value, self.torch.Tensor) and value.device != self.device}
+        if feature_devices:
+            raise ProbeError(f"extracted vision tensor device mismatch: selected={self.device}, "
+                             f"actual={feature_devices}")
         captured["pixel_values"] = pixel_values
         captured["image_grid_thw"] = grid_thw
         return captured
@@ -364,5 +418,6 @@ class QwenVisionExtractor:
             "token_order": self.order,
             "execution": {"dtype": "torch.bfloat16", "attention": "sdpa", "eval": True,
                           "inference_mode": True, "language_model_forward_used": False,
-                          "generation_used": False, "preprocess_mode": getattr(self, "preprocess_mode", None)},
+                          "generation_used": False, "preprocess_mode": getattr(self, "preprocess_mode", None),
+                          "device": self.runtime_diagnostics()},
         }

@@ -12,6 +12,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,7 +29,13 @@ from event_delta.flow_warp import (  # noqa: E402
     sevd_flow_to_pixel_displacement,
 )
 from event_delta.metrics import compare_stale_and_propagated, summarize_by_offset  # noqa: E402
-from event_delta.qwen_features import ProbeError, QwenVisionExtractor, TokenOrderError  # noqa: E402
+from event_delta.qwen_features import (  # noqa: E402
+    ProbeError,
+    QwenVisionExtractor,
+    TokenOrderError,
+    require_runtime,
+    select_device_name,
+)
 from tools.audit_sevd import find_recording, frame_id  # noqa: E402
 
 
@@ -132,29 +139,43 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def cuda_timings(torch: Any, operation: Callable[[], Any], warmup: int, repeats: int) -> dict[str, Any]:
+def device_timings(torch: Any, device_type: str, operation: Callable[[], Any],
+                   warmup: int, repeats: int) -> dict[str, Any]:
     for _ in range(warmup):
         operation()
-    torch.cuda.synchronize()
     timings = []
-    for _ in range(repeats):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        operation()
-        end.record()
+    if device_type == "cuda":
         torch.cuda.synchronize()
-        timings.append(float(start.elapsed_time(end)))
+        for _ in range(repeats):
+            torch.cuda.synchronize()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            operation()
+            end.record()
+            torch.cuda.synchronize()
+            timings.append(float(start.elapsed_time(end)))
+        method = "CUDA events with synchronize before and after each measurement"
+    else:
+        for _ in range(repeats):
+            start = time.perf_counter()
+            operation()
+            timings.append((time.perf_counter() - start) * 1000.0)
+        method = "CPU perf_counter; no torch.cuda calls"
     return {"warmup": warmup, "repeats": repeats, "milliseconds": timings,
-            "p50_ms": float(np.percentile(timings, 50)), "p95_ms": float(np.percentile(timings, 95))}
+            "method": method, "p50_ms": float(np.percentile(timings, 50)),
+            "p95_ms": float(np.percentile(timings, 95))}
 
 
 def profile_efficiency(extractor: QwenVisionExtractor, image_path: Path, stage: str,
                        feature: Any, displacement: Any, warmup: int, repeats: int) -> dict[str, Any]:
     torch = extractor.torch
     inputs = extractor.preprocess(image_path)
-    vision = cuda_timings(torch, lambda: extractor.feature_grid_from_inputs(inputs, stage), warmup, repeats)
+    device_type = extractor.device.type
+    vision = device_timings(torch, device_type, lambda: extractor.feature_grid_from_inputs(inputs, stage),
+                            warmup, repeats)
     confidence = torch.ones(feature.shape[:2], dtype=torch.float32, device=feature.device)
-    warp = cuda_timings(torch, lambda: forward_splat_torch(feature, displacement, confidence), warmup, repeats)
+    warp = device_timings(torch, device_type,
+                          lambda: forward_splat_torch(feature, displacement, confidence), warmup, repeats)
 
     def nine_steps() -> Any:
         current, current_confidence = feature, confidence
@@ -162,14 +183,14 @@ def profile_efficiency(extractor: QwenVisionExtractor, image_path: Path, stage: 
             current, _valid, current_confidence = forward_splat_torch(current, displacement, current_confidence)
         return current
 
-    recurrent = cuda_timings(torch, nine_steps, warmup, repeats)
+    recurrent = device_timings(torch, device_type, nine_steps, warmup, repeats)
     dense_cost = 10 * vision["p50_ms"]
     propagation_cost = vision["p50_ms"] + 9 * warp["p50_ms"]
-    return {"timing_method": "CUDA events after warmup; torch.cuda.synchronize after every measurement",
+    return {"timing_method": vision["method"], "selected_device": str(extractor.device),
             "timing_scope": "vision-module GPU forward excludes image decode/processor and disk I/O; warp excludes flow disk I/O",
             "vision_encoder": vision, "single_feature_warp": warp, "recurrent_nine_step_warp": recurrent,
-            "cuda_memory_allocated_bytes": int(torch.cuda.memory_allocated()),
-            "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated()),
+            "cuda_memory_allocated_bytes": (int(torch.cuda.memory_allocated()) if device_type == "cuda" else None),
+            "peak_cuda_memory_bytes": (int(torch.cuda.max_memory_allocated()) if device_type == "cuda" else None),
             "feature_shape": list(feature.shape), "visual_token_count": int(feature.shape[0] * feature.shape[1]),
             "dense_10hz_cost_ms": dense_cost, "oracle_1hz_plus_9warp_cost_ms": propagation_cost,
             "theoretical_speedup": dense_cost / propagation_cost if propagation_cost > 0 else None,
@@ -344,6 +365,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260929)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--feature-stage", choices=("pre_merger", "post_merger"), default="post_merger")
     parser.add_argument("--motion-threshold-pixels", type=float, default=1.0)
     parser.add_argument("--minimum-coverage", type=float, default=0.5)
@@ -363,17 +385,47 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --windows must divide evenly across recordings", file=sys.stderr)
         return 2
     output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        startup_torch, _transformers = require_runtime()
+        startup_device = select_device_name(args.device, bool(startup_torch.cuda.is_available()))
+    except ProbeError as exc:
+        print(f"blocked: {exc}", file=sys.stderr, flush=True)
+        return 2
+    startup_runtime = {
+        "requested_device": args.device,
+        "selected_device": startup_device,
+        "torch_cuda_is_available": bool(startup_torch.cuda.is_available()),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "model_parameter_device": None,
+        "input_tensor_device": None,
+        "extracted_feature_device": None,
+        "feature_stage": args.feature_stage,
+        "feature_grid": None,
+        "feature_shape": None,
+    }
+    print(json.dumps(startup_runtime, ensure_ascii=False), flush=True)
+    (output_dir / "config.json").write_text(json.dumps({"status": "starting", "runtime": startup_runtime},
+                                                        indent=2, ensure_ascii=False) + "\n",
+                                             encoding="utf-8")
     per_recording_count = args.windows // len(args.recording)
     indexes, selected = {}, []
+    phase_start = time.perf_counter()
+    print("resolving recordings", flush=True)
     try:
-        for position, recording in enumerate(args.recording):
+        for recording in args.recording:
             recording_root = find_recording(root, recording)
             rgb = index_files(recording_root / "rgb_camera", ".png")
             flow = index_files(recording_root / "optical_flow_camera", ".npz")
             indexes[recording] = {"rgb": rgb, "flow": flow, "root": recording_root}
+        print(f"resolving recordings done in {time.perf_counter() - phase_start:.1f}s", flush=True)
+        phase_start = time.perf_counter()
+        print("sampling windows (reads and decompresses candidate flow NPZ files on CPU)", flush=True)
+        for position, recording in enumerate(args.recording):
+            rgb, flow = indexes[recording]["rgb"], indexes[recording]["flow"]
             chosen = select_activity_windows(rgb, flow, per_recording_count, args.anchor_stride,
                                              args.max_offset, args.seed + position)
             selected.extend({"recording": recording, **item} for item in chosen)
+        print(f"sampling windows done in {time.perf_counter() - phase_start:.1f}s", flush=True)
     except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -387,6 +439,8 @@ def main(argv: list[str] | None = None) -> int:
     config = {"scope": "R2a Qwen vision-feature + GT-flow oracle propagation smoke test",
               "dataset_root": str(root), "recordings": args.recording, "model": args.model,
               "git_commit": revision, "data_ranges": data_ranges,
+              "requested_device": args.device,
+              "runtime": startup_runtime,
               "seed": args.seed, "windows": args.windows, "windows_per_recording": per_recording_count,
               "anchor_stride": args.anchor_stride, "max_offset": args.max_offset,
               "feature_stage": args.feature_stage, "motion_threshold_pixels": args.motion_threshold_pixels,
@@ -409,10 +463,19 @@ def main(argv: list[str] | None = None) -> int:
     first_image = indexes[first_window["recording"]]["rgb"][first_window["anchor_frame_id"]]
     probe_path = output_dir / "probe.json"
     try:
-        extractor = QwenVisionExtractor(args.model, args.local_files_only, "cuda")
-        probe = extractor.probe_image(first_image)
+        phase_start = time.perf_counter()
+        print("loading processor/model", flush=True)
+        extractor = QwenVisionExtractor(args.model, args.local_files_only, args.device)
+        print(f"loading processor/model done in {time.perf_counter() - phase_start:.1f}s", flush=True)
+        probe_inputs = extractor.preprocess(first_image)
+        probe_feature, probe = extractor.encode_inputs(probe_inputs, args.feature_stage)
+        runtime = extractor.runtime_diagnostics(probe_inputs, probe_feature, args.feature_stage)
+        config["runtime"] = runtime
+        (output_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+                                                 encoding="utf-8")
+        print(json.dumps(runtime, ensure_ascii=False), flush=True)
         probe.update(model=args.model, image=str(first_image), local_files_only=args.local_files_only,
-                     git_commit=revision)
+                     git_commit=revision, runtime=runtime)
         probe_path.write_text(json.dumps(probe, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         if probe["token_order"]["status"] != "confirmed_from_installed_source":
             raise TokenOrderError(probe["token_order"]["warning"])
@@ -428,22 +491,30 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     torch = extractor.torch
-    torch.cuda.reset_peak_memory_stats()
+    if extractor.device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
     rows, qualitative = [], None
     representative_feature = representative_displacement = None
     try:
-        for window in selected:
+        for window_index, window in enumerate(selected, 1):
+            window_start = time.perf_counter()
             recording, anchor = window["recording"], window["anchor_frame_id"]
             rgb, flows = indexes[recording]["rgb"], indexes[recording]["flow"]
             validate_window_files(rgb, flows, anchor, args.max_offset)
+            print(f"encoding anchor/target: window {window_index}/{len(selected)} recording={recording} "
+                  f"anchor={anchor}", flush=True)
             anchor_feature = extractor.feature_grid_from_image(rgb[anchor], args.feature_stage).detach()
+            extractor.runtime_diagnostics(feature=anchor_feature, stage=args.feature_stage)
             propagated = anchor_feature
             confidence = torch.ones(anchor_feature.shape[:2], dtype=torch.float32, device=anchor_feature.device)
             coverage_history = []
+            print(f"recurrent warp: window {window_index}/{len(selected)} offsets=1..{args.max_offset}",
+                  flush=True)
             for offset in range(1, args.max_offset + 1):
                 transition = anchor + offset - 1
                 raw_numpy = read_flow(flows[transition])
-                raw = torch.from_numpy(raw_numpy).to(anchor_feature.device)
+                raw = torch.from_numpy(raw_numpy).to(extractor.device)
                 displacement = sevd_flow_to_feature_displacement(raw, anchor_feature.shape[:2], raw_numpy.shape[:2])
                 sampled_flow = resize_flow_to_grid(raw, anchor_feature.shape[:2])
                 pixel_displacement = sevd_flow_to_pixel_displacement(sampled_flow, raw_numpy.shape[:2])
@@ -477,10 +548,14 @@ def main(argv: list[str] | None = None) -> int:
                                    "target": target_numpy, "valid": valid_numpy, "motion": motion_numpy}
                 if representative_feature is None:
                     representative_feature, representative_displacement = anchor_feature, displacement
+            print(f"window done: recording={recording} window={window_index}/{len(selected)} anchor={anchor} "
+                  f"elapsed={time.perf_counter() - window_start:.1f}s", flush=True)
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
         print(f"error during oracle evaluation: {exc}", file=sys.stderr)
         return 2
 
+    phase_start = time.perf_counter()
+    print("aggregating/writing results", flush=True)
     offset_summary = summarize_by_offset(rows)
     windows = window_summaries(rows)
     write_csv(output_dir / "per_offset_metrics.csv", rows)
@@ -499,7 +574,8 @@ def main(argv: list[str] | None = None) -> int:
     plot_qualitative(qualitative, output_dir / "qualitative_features.png")
     (output_dir / "summary.md").write_text(summary_markdown(rows, offset_summary, efficiency, decision),
                                              encoding="utf-8")
-    print(f"wrote {output_dir}; decision={decision['status']}")
+    print(f"aggregating/writing results done in {time.perf_counter() - phase_start:.1f}s", flush=True)
+    print(f"wrote {output_dir}; decision={decision['status']}", flush=True)
     return 0
 
 

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.event_delta.qwen_features import ProbeError, TokenOrderError, tokens_to_grid
+from src.event_delta.qwen_features import ProbeError, TokenOrderError, select_device_name, tokens_to_grid
 
 
 CONFIRMED_ORDER = {"status": "confirmed_from_installed_source"}
@@ -26,3 +26,11 @@ def test_unresolved_token_order_stops_before_reshape():
     with pytest.raises(TokenOrderError, match="unresolved"):
         tokens_to_grid(np.zeros((6, 3)), np.array([[1, 4, 6]]), 2, "post_merger",
                        {"status": "unresolved", "warning": "unresolved order"})
+
+
+def test_device_selection_does_not_silently_fall_back_from_explicit_cuda():
+    assert select_device_name("auto", True) == "cuda"
+    assert select_device_name("auto", False) == "cpu"
+    assert select_device_name("cpu", True) == "cpu"
+    with pytest.raises(ProbeError, match="cuda.*requested"):
+        select_device_name("cuda", False)
