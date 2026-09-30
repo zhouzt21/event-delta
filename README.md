@@ -152,7 +152,7 @@ PyTorch 2.6 加载官方 legacy `dsec.tar` 时显式使用 `weights_only=False`�
 
 ## R3b：E-RAFT recurrent feature propagation smoke
 
-R3b 固定复用 R2 的 Qwen3-VL-2B `post_merger` feature、10-frame anchor stride、offset 1..9、SEVD GT flow decode、forward splat 和 feature metrics。每步只把 `Event_i + Event_{i+1}` 输入 E-RAFT；`flow_i` 只用于 GT-oracle propagation、motion mask 和离线 flow quality。第一轮固定为 fixed-3/fixed-4 各 low/mid/high 三个 window（总计 6 个，seed 20260929），不自动调参。
+R3b 固定复用 R2 的 Qwen3-VL-2B `post_merger` feature、10-frame anchor stride、offset 1..9、SEVD GT flow decode、forward splat 和 feature metrics。每步只把 `Event_i + Event_{i+1}` 输入 E-RAFT；`flow_i` 只用于 GT-flow geometric-reference propagation、motion mask 和离线 flow quality。第一轮固定为 fixed-3/fixed-4 各 low/mid/high 三个 window（总计 6 个，seed 20260929），不自动调参。
 
 服务器环境需同时提供已缓存的 Qwen 模型、固定 commit 的外部 E-RAFT checkout 和用户确认来自官方 E-RAFT 下载地址的 `dsec.tar`：
 
@@ -168,6 +168,24 @@ CUDA_VISIBLE_DEVICES=0 python tools/run_r3_eraft_propagation.py \
   --output-dir artifacts/r3b_eraft_propagation
 ```
 
-预期输出为 `config.json`、`environment.json`、`per_offset_metrics.csv`、`window_summary.csv`、`aggregate_metrics.csv`、`efficiency.json`、`summary.md`、两张 offset 曲线和 fixed-3/fixed-4 各一张 feature qualitative。正式比较始终保留 stale、raw E-RAFT、固定 event-support mask E-RAFT 和 GT oracle，并使用三种 propagation valid mask 的交集评价所有方法；support mask 固定使用两个 packet 的坐标并集和 3-pixel 方形膨胀，不做搜索。
+预期输出为 `config.json`、`environment.json`、`per_offset_metrics.csv`、`window_summary.csv`、`aggregate_metrics.csv`、`efficiency.json`、`summary.md`、两张 offset 曲线和 fixed-3/fixed-4 各一张 feature qualitative。正式比较始终保留 stale、raw E-RAFT、固定 event-support mask E-RAFT 和 GT-flow geometric reference，并使用三种 propagation valid mask 的交集评价所有方法；support mask 固定使用两个 packet 的坐标并集和 3-pixel 方形膨胀，不做搜索。
 
-`summary.md` 分开报告 R3a 接口集成是否通过与 R3b 科学结论。只有两条 recording 的 motion-token raw recovery 都为正、raw 或固定 mask 关闭至少 20% GT-oracle gap、offset 3/5/9 至少两个为正、raw coverage 不比 GT oracle 低超过 0.10，且完整 Event decode→voxel→E-RAFT→flow/grid conversion→feature warp 延时齐全，才进入 `expanded`；否则固定输出 `stop/diagnostic`。单个 transition 方向正确或仅报告 E-RAFT network forward latency都不构成 R3b 成功。
+`summary.md` 分开报告 R3a 接口集成是否通过与 R3b 科学结论。统计 gate 的稳定定义见下节；单个 transition 方向正确或仅报告 E-RAFT network forward latency 都不构成 R3b 成功。
+
+### R3b 统计审计与离线重聚合
+
+旧版 observation-level `oracle_gap_closed` 会在单条 GT-flow improvement 接近零时产生大比值；这些逐 observation 比值仅保留在 diagnostic CSV，不能再取均值驱动 gate 或主图。正式统计先聚合 paired stale/method cosine distance，再计算 aggregate recovery 和 Event improvement / GT-flow improvement。后者称为 stable reference ratio；GT-flow aggregate improvement 不为正时记为 N/A，且比值允许大于 1。新报告称其为 **GT-flow geometric reference**，不将其描述为严格 upper bound；旧 `gt_oracle` CSV 字段仅为兼容保留。
+
+已有 smoke 的 `per_offset_metrics.csv` 已包含 paired distance、token count、window、recording、offset 和 activity 字段，因此无需重跑 GPU，可直接生成审计结果：
+
+```bash
+python tools/audit_r3_statistics.py \
+  --per-offset-metrics "$R3B_OUTPUT/per_offset_metrics.csv" \
+  --output-dir "$R3B_OUTPUT/statistical_audit" \
+  --bootstrap-replicates 2000 \
+  --seed 20260929
+```
+
+审计输出包含稳定的 `aggregate_metrics.csv`（overall、recording overall、offset、activity；window-macro 与 token-weighted micro）、`observation_ratio_diagnostics.csv`、complete-window paired `bootstrap.json`、新 `decision.json`、无小分母 spike 的 `oracle_gap_closed.png` 和 `summary.md`。bootstrap 始终以完整 window 连同全部 offsets 为重采样单位；6-window smoke 的区间明确标为 exploratory，不作为硬门槛。
+
+修正后的 gate 不使用 mean-of-ratios，也不要求 stable reference ratio 小于或等于 1。它要求两条 recording 的 raw motion recovery 均为正、offset 3/5/9 的 raw recovery 至少两个为正、masked all-valid aggregate recovery 为正，并保留 coverage 与完整 delta latency 检查；raw all-valid 为负时单独写出 background-drift warning。

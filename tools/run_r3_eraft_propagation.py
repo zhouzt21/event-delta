@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import platform
 import subprocess
@@ -41,7 +40,11 @@ from event_delta.r3_propagation import (  # noqa: E402
     complete_online_delta_latency,
     event_support_mask,
     expanded_decision,
+    observation_ratio_diagnostics,
+    paired_window_bootstrap,
     predicted_flow_to_feature_displacement,
+    stable_aggregate,
+    stable_aggregate_report,
     transition_frame_ids,
     validate_latency_fields,
 )
@@ -141,22 +144,19 @@ def flow_quality(prediction: np.ndarray, gt: np.ndarray, motion_threshold: float
     return output
 
 
-def aggregate_rows(rows: list[dict[str, Any]], group_keys: tuple[str, ...]) -> list[dict[str, Any]]:
-    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+def stable_window_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        groups[tuple(row[key] for key in group_keys)].append(row)
-    output = []
-    excluded = {"anchor_frame_id", "source_frame_id", "target_frame_id", "flow_frame_id", "offset"}
-    for identity, group in sorted(groups.items(), key=lambda item: tuple(str(x) for x in item[0])):
-        item: dict[str, Any] = dict(zip(group_keys, identity))
-        item["observation_count"] = len(group)
-        numeric_keys = list(dict.fromkeys(key for row in group for key, value in row.items()
-                                          if key not in excluded and isinstance(value, (int, float))))
-        for key in numeric_keys:
-            values = [float(row[key]) for row in group if row.get(key) is not None
-                      and math.isfinite(float(row[key]))]
-            item[f"{key}_mean"] = float(np.mean(values)) if values else None
-        output.append(item)
+        groups[(str(row["recording"]), int(row["anchor_frame_id"]))].append(row)
+    output: list[dict[str, Any]] = []
+    for (recording, anchor), group in sorted(groups.items()):
+        identity = {"recording": recording, "anchor_frame_id": anchor,
+                    "activity_group": group[0]["activity_group"],
+                    "activity_stratum": group[0]["activity_stratum"]}
+        for scope in ("all_valid", "motion"):
+            for distance_metric in ("cosine_distance", "l1_distance", "l2_distance"):
+                output.extend(stable_aggregate(group, scope, "window_macro", identity,
+                                               distance_metric))
     return output
 
 
@@ -173,8 +173,8 @@ def efficiency_report(rows: list[dict[str, Any]], peak_cuda_memory: int | None) 
             "dataset_npz_decode_ms": "old/new Event NPZ decode; GT-flow decode excluded from online path",
             "voxelization_ms": "two independent packet voxels",
             "eraft_forward_ms": "standard zero-init forward, no warm start; one startup warmup excluded",
-            "flow_resize_grid_conversion_ms": "prediction upsample plus raw/masked/GT feature-grid conversion",
-            "feature_warp_ms": "three recurrent forward splats (raw, masked, GT)",
+            "flow_resize_grid_conversion_ms": "prediction upsample plus raw E-RAFT feature-grid conversion",
+            "feature_warp_ms": "raw E-RAFT recurrent forward splat",
             "qwen_vit_ms": "dense target vision feature extraction, offline reference only",
             "complete_online_delta_path_ms": "Event decode + voxelization + E-RAFT + flow conversion + raw feature warp",
         },
@@ -192,27 +192,29 @@ def _matplotlib() -> Any:
     return plt
 
 
-def plot_recovery(rows: list[dict[str, Any]], output_dir: Path) -> None:
+def plot_recovery(stats: list[dict[str, Any]], output_dir: Path) -> None:
     plt = _matplotlib()
-    offsets = sorted({int(row["offset"]) for row in rows})
+    offsets = sorted({int(row["group"]) for row in stats if row["group_type"] == "offset"})
     for suffix, key, ylabel in (
-        ("recovery_vs_offset.png", "recovery", "relative cosine-error recovery"),
-        ("oracle_gap_closed.png", "oracle_gap_closed", "fraction of GT-oracle gap closed"),
+        ("recovery_vs_offset.png", "aggregate_recovery", "aggregate cosine-error recovery"),
+        ("oracle_gap_closed.png", "stable_reference_ratio", "Event / GT-flow aggregate improvement"),
     ):
         fig, axis = plt.subplots(figsize=(8, 4.5))
         for scope, linestyle in (("all_valid", "-"), ("motion", "--")):
             for method, marker in (("raw_eraft", "o"), ("masked_eraft", "s")):
                 values = []
                 for offset in offsets:
-                    samples = [row.get(f"{scope}_{method}_cosine_distance_{key}") for row in rows
-                               if int(row["offset"]) == offset]
-                    samples = [float(value) for value in samples if value is not None]
-                    values.append(float(np.mean(samples)) if samples else np.nan)
+                    match = [row for row in stats if row["group_type"] == "offset"
+                             and row["group"] == str(offset) and row["scope"] == scope
+                             and row["aggregation"] == "window_macro" and row["method"] == method
+                             and row["distance_metric"] == "cosine_distance"]
+                    value = match[0][key] if len(match) == 1 else None
+                    values.append(float(value) if value is not None else np.nan)
                 axis.plot(offsets, values, linestyle=linestyle, marker=marker,
                           label=f"{method}/{scope}")
         axis.axhline(0, color="black", linewidth=1)
-        if key == "oracle_gap_closed":
-            axis.axhline(0.2, color="tab:red", linewidth=1, linestyle=":", label="expanded threshold")
+        if key == "stable_reference_ratio":
+            axis.set_title("Ratio of aggregate improvements; small GT-flow denominator = N/A")
         axis.set(xlabel="offset from anchor", ylabel=ylabel)
         axis.grid(alpha=0.3)
         axis.legend(fontsize=8)
@@ -235,7 +237,8 @@ def plot_qualitative(example: dict[str, Any], path: Path) -> None:
     axes[1].imshow(example["target_rgb"]); axes[1].set_title("dense target RGB (offline)")
     for axis, method in zip(axes[2:6], methods):
         shown = axis.imshow(np.where(common, residuals[method], np.nan), cmap="magma", vmin=0, vmax=limit)
-        axis.set_title(f"{method} feature L2")
+        label = "GT-flow geometric reference" if method == "gt_oracle" else method
+        axis.set_title(f"{label} feature L2")
         fig.colorbar(shown, ax=axis, fraction=0.046, pad=0.04)
     axes[6].imshow(common, cmap="gray", vmin=0, vmax=1); axes[6].set_title("shared evaluation mask")
     axes[7].imshow(common & example["motion"], cmap="gray", vmin=0, vmax=1)
@@ -248,27 +251,38 @@ def plot_qualitative(example: dict[str, Any], path: Path) -> None:
     plt.close(fig)
 
 
-def summary_markdown(decision: dict[str, Any], rows: list[dict[str, Any]],
-                     efficiency: dict[str, Any], r3a_passed: bool) -> str:
-    def mean(key: str) -> float | None:
-        values = [float(row[key]) for row in rows if row.get(key) is not None]
-        return float(np.mean(values)) if values else None
+def summary_markdown(decision: dict[str, Any], stats: list[dict[str, Any]],
+                     bootstrap: dict[str, Any], efficiency: dict[str, Any], r3a_passed: bool) -> str:
+    def stat(scope: str, method: str) -> dict[str, Any]:
+        matches = [row for row in stats if row["group_type"] == "overall"
+                   and row["group"] == "overall" and row["scope"] == scope
+                   and row["aggregation"] == "window_macro" and row["method"] == method
+                   and row["distance_metric"] == "cosine_distance"]
+        if len(matches) != 1:
+            raise ValueError(f"missing overall stable statistic for {scope}/{method}")
+        return matches[0]
+    raw_all, masked_all = stat("all_valid", "raw_eraft"), stat("all_valid", "masked_eraft")
+    raw_motion, masked_motion = stat("motion", "raw_eraft"), stat("motion", "masked_eraft")
+    gt_motion = stat("motion", "gt_oracle")
+    scientific = ("promising exploratory smoke" if decision["status"] == "expanded"
+                  else "exploratory stop/diagnostic smoke")
     return f"""# R3b E-RAFT Qwen feature-propagation smoke
 
 ## Integration status
 
 - R3a integration passed in this run: **{str(r3a_passed).lower()}** (pinned repo, strict checkpoint load, finite shaped output).
 - R3b scientific result: **{decision['status']}**.
+- Current result: **{scientific}**.
 - This decision is based on all six fixed windows, not on a single transition direction check.
 
 ## Scientific comparison
 
-- Motion-token raw E-RAFT recovery: {mean('motion_raw_eraft_cosine_distance_recovery')}.
-- Motion-token masked E-RAFT recovery: {mean('motion_masked_eraft_cosine_distance_recovery')}.
-- Motion-token GT oracle recovery: {mean('motion_gt_oracle_cosine_distance_recovery')}.
-- Raw E-RAFT oracle gap closed: {mean('motion_raw_eraft_cosine_distance_oracle_gap_closed')}.
-- Masked E-RAFT oracle gap closed: {mean('motion_masked_eraft_cosine_distance_oracle_gap_closed')}.
+- Raw Event improves motion tokens but hurts all-valid tokens: motion recovery={raw_motion['aggregate_recovery']}; all-valid recovery={raw_all['aggregate_recovery']}.
+- The fixed Event-support mask restores positive all-valid recovery: all-valid recovery={masked_all['aggregate_recovery']}; motion recovery={masked_motion['aggregate_recovery']}.
+- GT-flow geometric reference motion recovery={gt_motion['aggregate_recovery']}; it is not described as a strict upper bound.
+- Stable raw/masked reference ratios are {raw_motion['stable_reference_ratio']} / {masked_motion['stable_reference_ratio']}. They use ratios of aggregate improvements, may exceed 1, and are informational only.
 - Decision criteria: `{json_dumps(decision['criteria'])}`.
+- Complete-window paired bootstrap uses {bootstrap['window_count']} windows; exploratory={str(bootstrap['exploratory']).lower()}. Its 95% CIs are reported, not gated.
 
 ## Efficiency boundary
 
@@ -280,10 +294,11 @@ def summary_markdown(decision: dict[str, Any], rows: list[dict[str, Any]],
 ## Boundary
 
 - Event_i + Event_i+1 predicts i->i+1. GT flow_i is used only for oracle propagation, motion masks, and flow-quality evaluation.
-- `stale`, raw E-RAFT, fixed event-support-masked E-RAFT, and GT oracle use the identical intersection token mask.
+- `stale`, raw E-RAFT, fixed event-support-masked E-RAFT, and the GT-flow geometric reference use the identical intersection token mask. Legacy CSV field names retain `gt_oracle` for compatibility.
 - The mask is a fixed union of Event_i/Event_i+1 coordinate support with the configured square dilation; no parameter search is performed.
 - Failure of the expanded gate means `stop/diagnostic`; this tool does not tune parameters automatically.
-- This is a feature-propagation validation, not VLM accuracy evaluation and not evidence that the vision encoder has already been saved in a production pipeline.
+- This is not yet a VLM downstream accuracy result.
+- This is not yet a real-time system result; measured timing is a smoke profile, not an end-to-end deployment claim.
 """
 
 
@@ -310,6 +325,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--motion-threshold-pixels", type=float, default=1.0)
     parser.add_argument("--support-dilation-radius", type=int, default=3)
     parser.add_argument("--maximum-coverage-drop", type=float, default=0.10)
+    parser.add_argument("--bootstrap-replicates", type=int, default=2000)
     args = parser.parse_args(argv)
     if args.recording is None:
         args.recording = ["fixed-3", "fixed-4"]
@@ -325,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     root = args.root.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
-    if not root.is_dir() or args.support_dilation_radius < 0:
+    if not root.is_dir() or args.support_dilation_radius < 0 or args.bootstrap_replicates <= 0:
         print("error: dataset root is missing or dilation radius is invalid", file=sys.stderr)
         return 2
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -353,8 +369,11 @@ def main(argv: list[str] | None = None) -> int:
         "event_support_mask": {"packets": "union(Event_i, Event_i+1)", "binary": True,
                                "dilation": "square MaxFilter", "dilation_radius_pixels": args.support_dilation_radius,
                                "parameter_search": False, "outside_flow": 0.0},
-        "evaluation_mask": "intersection(raw E-RAFT valid, masked E-RAFT valid, GT-oracle valid)",
+        "evaluation_mask": "intersection(raw E-RAFT valid, masked E-RAFT valid, GT-flow-reference valid)",
         "motion_threshold_pixels": args.motion_threshold_pixels,
+        "bootstrap": {"sampling_unit": "complete_window", "paired": True,
+                      "seed": args.seed, "replicates": args.bootstrap_replicates,
+                      "hard_gate": False},
         "device": {"requested": args.device, "selected": device_name},
     }
     atomic_write_json(output_dir / "config.json", config)
@@ -552,29 +571,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"blocked during R3b evaluation: {exc}", file=sys.stderr)
         return 2
 
-    windows = aggregate_rows(rows, ("recording", "anchor_frame_id", "activity_stratum"))
-    aggregates = [{"group_type": "recording_offset", **item}
-                  for item in aggregate_rows(rows, ("recording", "offset"))]
-    aggregates.extend({"group_type": "offset", **item} for item in aggregate_rows(rows, ("offset",)))
-    aggregates.extend({"group_type": "overall", **item} for item in aggregate_rows(rows, ()))
+    windows = stable_window_summaries(rows)
+    aggregates = stable_aggregate_report(rows)
+    diagnostics = observation_ratio_diagnostics(rows)
+    bootstrap = paired_window_bootstrap(rows, args.bootstrap_replicates, args.seed)
     write_csv(output_dir / "per_offset_metrics.csv", rows)
     write_csv(output_dir / "window_summary.csv", windows)
     write_csv(output_dir / "aggregate_metrics.csv", aggregates)
+    write_csv(output_dir / "observation_ratio_diagnostics.csv", diagnostics)
+    atomic_write_json(output_dir / "bootstrap.json", bootstrap)
     peak_memory = int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
     efficiency = efficiency_report(rows, peak_memory)
     atomic_write_json(output_dir / "efficiency.json", efficiency)
-    decision = expanded_decision(rows, args.recording, maximum_coverage_drop=args.maximum_coverage_drop)
+    decision = expanded_decision(rows, args.recording, maximum_coverage_drop=args.maximum_coverage_drop,
+                                 stable_stats=aggregates)
     r3a_passed = bool(r3a_output_valid and checkpoint_metadata.get("strict_load"))
     config.update(status="complete", r3a_integration_passed=r3a_passed,
                   r3b_scientific_result=decision, row_count=len(rows))
     atomic_write_json(output_dir / "config.json", config)
-    plot_recovery(rows, output_dir)
+    plot_recovery(aggregates, output_dir)
     for recording in args.recording:
         if recording not in qualitative:
             raise RuntimeError(f"missing qualitative example for {recording}")
         plot_qualitative(qualitative[recording], output_dir / f"qualitative_features_{recording}.png")
     (output_dir / "summary.md").write_text(
-        summary_markdown(decision, rows, efficiency, r3a_passed), encoding="utf-8")
+        summary_markdown(decision, aggregates, bootstrap, efficiency, r3a_passed), encoding="utf-8")
     print(f"wrote {output_dir}; R3b={decision['status']}", flush=True)
     return 0
 
