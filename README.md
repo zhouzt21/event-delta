@@ -149,3 +149,25 @@ CUDA_VISIBLE_DEVICES=0 python tools/smoke_eraft_sevd.py \
 PyTorch 2.6 加载官方 legacy `dsec.tar` 时显式使用 `weights_only=False`，随后仍以 `strict=True` 加载 state dict。由于关闭 `weights_only` 可能执行 pickle 内容，该入口只允许用于用户明确提供并确认来自官方 E-RAFT 下载地址的 checkpoint，禁止用于来源未知的 checkpoint；运行记录会保存 checkpoint 路径、文件大小、SHA-256 和该安全选择。
 
 本 smoke 只有在 checkpoint strict load、输入输出 shape/finite/尺度正确、预测非全零、正号明显优于负号且正确顺序明显优于 swapped 时才标记 `passed`。否则写出 `blocked` 与原因；这表示接口、方向或单样本诊断尚未通过，不代表正式 E-RAFT 泛化结论。timestamp 单位、Event 区间归属、flow GT 解码仍沿用 R1.2/R3a audit 的既有边界，不在本轮重新论证。
+
+## R3b：E-RAFT recurrent feature propagation smoke
+
+R3b 固定复用 R2 的 Qwen3-VL-2B `post_merger` feature、10-frame anchor stride、offset 1..9、SEVD GT flow decode、forward splat 和 feature metrics。每步只把 `Event_i + Event_{i+1}` 输入 E-RAFT；`flow_i` 只用于 GT-oracle propagation、motion mask 和离线 flow quality。第一轮固定为 fixed-3/fixed-4 各 low/mid/high 三个 window（总计 6 个，seed 20260929），不自动调参。
+
+服务器环境需同时提供已缓存的 Qwen 模型、固定 commit 的外部 E-RAFT checkout 和用户确认来自官方 E-RAFT 下载地址的 `dsec.tar`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/run_r3_eraft_propagation.py \
+  --root "$SEVD_ROOT" \
+  --recording fixed-3 \
+  --recording fixed-4 \
+  --eraft-root "$ERAFT_ROOT" \
+  --checkpoint "$ERAFT_CHECKPOINT" \
+  --device cuda \
+  --local-files-only \
+  --output-dir artifacts/r3b_eraft_propagation
+```
+
+预期输出为 `config.json`、`environment.json`、`per_offset_metrics.csv`、`window_summary.csv`、`aggregate_metrics.csv`、`efficiency.json`、`summary.md`、两张 offset 曲线和 fixed-3/fixed-4 各一张 feature qualitative。正式比较始终保留 stale、raw E-RAFT、固定 event-support mask E-RAFT 和 GT oracle，并使用三种 propagation valid mask 的交集评价所有方法；support mask 固定使用两个 packet 的坐标并集和 3-pixel 方形膨胀，不做搜索。
+
+`summary.md` 分开报告 R3a 接口集成是否通过与 R3b 科学结论。只有两条 recording 的 motion-token raw recovery 都为正、raw 或固定 mask 关闭至少 20% GT-oracle gap、offset 3/5/9 至少两个为正、raw coverage 不比 GT oracle 低超过 0.10，且完整 Event decode→voxel→E-RAFT→flow/grid conversion→feature warp 延时齐全，才进入 `expanded`；否则固定输出 `stop/diagnostic`。单个 transition 方向正确或仅报告 E-RAFT network forward latency都不构成 R3b 成功。
