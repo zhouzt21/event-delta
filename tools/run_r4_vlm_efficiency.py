@@ -89,7 +89,8 @@ def capture_state(extractor: QwenVisionExtractor, adapter: QwenVisualInjectionAd
     with adapter.capture() as captured:
         with measured_stage(extractor.torch, extractor.device, target, "anchor_vision_encoding"):
             vision_call(extractor, inputs)
-    return adapter.make_state(captured["output"], inputs["image_grid_thw"], timestamp, anchor, audit)
+    return adapter.make_state(captured["output"], inputs["image_grid_thw"], timestamp, anchor,
+                              audit, require_spatial_layout=True)
 
 
 def eraft_once(torch: Any, model: Any, old: Any, new: Any, iterations: int) -> Any:

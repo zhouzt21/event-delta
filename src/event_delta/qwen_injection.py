@@ -145,20 +145,40 @@ class VisualState:
     layout_verified: bool
     validity: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    tensor_paths: tuple[str, ...] = ()
+    unresolved_spatial_paths: tuple[str, ...] = ()
 
     @property
     def token_count(self) -> int:
         return self.spatial_grid_hw[0] * self.spatial_grid_hw[1]
 
+    def path_diagnostics(self) -> dict[str, Any]:
+        """Describe complete cached branches separately from propagation-capable branches."""
+        tensors = dict(tree_tensors(self.vision_output))
+        return {
+            "final_embedding_path": self.final_path,
+            "all_tensor_paths": list(self.tensor_paths or tensors),
+            "deepstack_paths": list(self.deepstack_paths),
+            "propagatable_spatial_paths": list(self.spatial_tensor_paths),
+            "unresolved_spatial_paths": list(self.unresolved_spatial_paths),
+            "spatial_propagation_ready": self.layout_verified,
+            "branch_grid_hw": {path: list(hw) for path, hw in self.branch_grid_hw.items()},
+        }
+
     def diagnostics(self) -> dict[str, Any]:
         tensors = dict(tree_tensors(self.vision_output))
+        paths = self.path_diagnostics()
         return {
             "image_grid_thw": list(self.image_grid_thw), "spatial_grid_hw": list(self.spatial_grid_hw),
             "merge_size": self.merge_size, "token_count": self.token_count,
-            "final_path": self.final_path, "spatial_tensor_paths": list(self.spatial_tensor_paths),
+            "final_path": self.final_path,
+            "tensor_paths": paths["all_tensor_paths"],
+            "spatial_tensor_paths": list(self.spatial_tensor_paths),
+            "propagatable_paths": paths["propagatable_spatial_paths"],
+            "unresolved_spatial_paths": paths["unresolved_spatial_paths"],
             "deepstack_present": bool(self.deepstack_paths),
             "deepstack_paths": list(self.deepstack_paths),
-            "branch_grid_hw": {path: list(hw) for path, hw in self.branch_grid_hw.items()},
+            "branch_grid_hw": paths["branch_grid_hw"],
             "visual_tensor_shapes": {path: list(tensor.shape) for path, tensor in tensors.items()},
             "dtype": self.dtype, "device": self.device,
             "state_timestamp": self.state_timestamp, "anchor_timestamp": self.anchor_timestamp,
@@ -168,6 +188,19 @@ class VisualState:
                          for path, mask in self.validity.items()},
             "metadata": self.metadata,
         }
+
+    def require_propagation_layout(self) -> None:
+        """Reject Event propagation unless every branch-like vision tensor has a proven grid."""
+        missing_grid = [path for path in self.spatial_tensor_paths if path not in self.branch_grid_hw]
+        unresolved_deepstack = [path for path in self.deepstack_paths
+                                if path not in self.branch_grid_hw]
+        if (not self.layout_verified or self.unresolved_spatial_paths
+                or missing_grid or unresolved_deepstack):
+            raise InjectionBlocked(
+                "visual state is complete for cached injection but not safe for spatial propagation: "
+                f"unresolved={list(self.unresolved_spatial_paths)}, missing_grid={missing_grid}, "
+                f"unresolved_deepstack={unresolved_deepstack}"
+            )
 
 
 def _check(name: str, required: bool, passed: bool, evidence: list[str],
@@ -476,7 +509,8 @@ class QwenVisualInjectionAdapter:
             self._lock.release()
 
     def make_state(self, output: Any, image_grid_thw: Any, state_timestamp: Any,
-                   anchor_timestamp: Any, source_audit: dict[str, Any]) -> VisualState:
+                   anchor_timestamp: Any, source_audit: dict[str, Any],
+                   require_spatial_layout: bool = True) -> VisualState:
         if self.order.get("status") != "confirmed_from_installed_source":
             raise InjectionBlocked("visual token ordering is not proven by installed source")
         grid = tuple(int(x) for x in image_grid_thw.reshape(-1).tolist())
@@ -503,10 +537,11 @@ class QwenVisualInjectionAdapter:
                 spatial.append((path, tensor))
         unresolved = [path for path, tensor in tensors
                       if getattr(tensor, "ndim", len(tensor.shape)) >= 2 and path not in branch_grid]
-        if unresolved:
+        if require_spatial_layout and unresolved:
             raise InjectionBlocked("vision output contains tensor branches without a proven spatial layout: "
                                    + ", ".join(unresolved))
-        deepstack = tuple(path for path, _tensor in spatial if path != final_path)
+        deepstack = tuple(path for path, tensor in tensors
+                          if path != final_path and getattr(tensor, "ndim", len(tensor.shape)) >= 2)
         source_deepstack = bool(source_audit.get("evidence", {}).get("deepstack_in_source"))
         if source_deepstack and not deepstack:
             raise InjectionBlocked("installed source contains DeepStack but full vision output did not expose it")
@@ -514,11 +549,20 @@ class QwenVisualInjectionAdapter:
         torch = __import__("torch")
         validity = {path: torch.ones(branch_grid[path], dtype=torch.float32, device=tensor.device)
                     for path, tensor in spatial}
-        return VisualState(output, grid, spatial_hw, self.merge_size, final_path,
-                           tuple(path for path, _tensor in spatial), deepstack, branch_grid,
-                           str(first.dtype), str(first.device), state_timestamp, anchor_timestamp, True,
-                           validity, {"source_deepstack_detected": source_deepstack,
-                                      "all_vision_return_values_preserved": True})
+        layout_verified = not unresolved and all(path in branch_grid for path in deepstack)
+        return VisualState(
+            vision_output=output, image_grid_thw=grid, spatial_grid_hw=spatial_hw,
+            merge_size=self.merge_size, final_path=final_path,
+            spatial_tensor_paths=tuple(path for path, _tensor in spatial),
+            deepstack_paths=deepstack, branch_grid_hw=branch_grid,
+            dtype=str(first.dtype), device=str(first.device), state_timestamp=state_timestamp,
+            anchor_timestamp=anchor_timestamp, layout_verified=layout_verified, validity=validity,
+            metadata={"source_deepstack_detected": source_deepstack,
+                      "all_vision_return_values_preserved": True,
+                      "spatial_propagation_required": require_spatial_layout},
+            tensor_paths=tuple(path for path, _tensor in tensors),
+            unresolved_spatial_paths=tuple(unresolved),
+        )
 
     def validate_placeholder_contract(self, inputs: dict[str, Any], state: VisualState) -> dict[str, Any]:
         input_ids = inputs.get("input_ids")
@@ -538,8 +582,7 @@ class QwenVisualInjectionAdapter:
 def propagate_visual_state(state: VisualState, flow_pixels: Any, state_timestamp: Any,
                            support_mask: Any | None = None) -> VisualState:
     """Propagate every verified spatial branch and causally fill splat holes from prior state."""
-    if not state.layout_verified:
-        raise InjectionBlocked("cannot propagate an unverified visual layout")
+    state.require_propagation_layout()
     torch = __import__("torch")
     if support_mask is not None:
         support = torch.as_tensor(support_mask, dtype=flow_pixels.dtype, device=flow_pixels.device)
@@ -568,13 +611,19 @@ def propagate_visual_state(state: VisualState, flow_pixels: Any, state_timestamp
                                     "hole_filling_policy": "previous_state_same_position",
                                     "target_rgb_or_gt_fill": False,
                                     "finite": bool(torch.isfinite(filled).all().item())}
-    return VisualState(_replace_tree(state.vision_output, replacements), state.image_grid_thw,
-                       state.spatial_grid_hw, state.merge_size, state.final_path,
-                       state.spatial_tensor_paths, state.deepstack_paths, state.branch_grid_hw,
-                       state.dtype, state.device,
-                       state_timestamp, state.anchor_timestamp, True, validity,
-                       {**state.metadata, "propagation": branch_diagnostics,
-                        "all_spatial_visual_branches_propagated": True})
+    return VisualState(
+        vision_output=_replace_tree(state.vision_output, replacements),
+        image_grid_thw=state.image_grid_thw, spatial_grid_hw=state.spatial_grid_hw,
+        merge_size=state.merge_size, final_path=state.final_path,
+        spatial_tensor_paths=state.spatial_tensor_paths, deepstack_paths=state.deepstack_paths,
+        branch_grid_hw=state.branch_grid_hw, dtype=state.dtype, device=state.device,
+        state_timestamp=state_timestamp, anchor_timestamp=state.anchor_timestamp,
+        layout_verified=True, validity=validity,
+        metadata={**state.metadata, "propagation": branch_diagnostics,
+                  "all_spatial_visual_branches_propagated": True},
+        tensor_paths=state.tensor_paths,
+        unresolved_spatial_paths=state.unresolved_spatial_paths,
+    )
 
 
 def compare_logits(native_a: Any, native_b: Any, injected: Any) -> dict[str, Any]:

@@ -8,6 +8,7 @@ import os
 import platform
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         "transformers_site_packages_modified": False, "global_monkey_patch": False,
     }
     atomic_write_json(audit_path, audit)
+    failure_stage = "argument_validation"
     if not args.image.is_file() or args.max_new_tokens <= 0:
         audit.update(phase="argument_validation",
                      failure_summary=["argument_validation: image is missing or max-new-tokens is invalid"])
@@ -114,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: image is missing or max-new-tokens is invalid", file=sys.stderr)
         return 2
     try:
+        failure_stage = "model_initialization"
         extractor = QwenVisionExtractor(args.model, args.local_files_only, args.device)
         torch = extractor.torch
         audit.update(transformers_version=extractor.transformers.__version__, phase="version_validation",
@@ -121,10 +124,12 @@ def main(argv: list[str] | None = None) -> int:
                                      "vision": extractor.structure["vision"].__class__.__name__,
                                      "processor": extractor.processor.__class__.__name__})
         atomic_write_json(audit_path, audit)
+        failure_stage = "transformers_version_validation"
         if extractor.transformers.__version__ != args.expected_transformers_version:
             raise InjectionBlocked(f"Transformers version mismatch: expected "
                                    f"{args.expected_transformers_version}, got "
                                    f"{extractor.transformers.__version__}")
+        failure_stage = "source_contract_audit"
         audit = audit_qwen_interface(extractor.model, extractor.structure["vision"],
                                      extractor.processor, extractor.order,
                                      extractor.transformers.__version__)
@@ -132,20 +137,23 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json(audit_path, audit)
         if audit["status"] != "ready":
             raise InjectionBlocked(contract_failure_message(audit))
+        failure_stage = "input_preparation"
         inputs = prepare_inputs(extractor, args.image.resolve(), args.prompt)
         adapter = QwenVisualInjectionAdapter(extractor.model, extractor.structure["vision"],
                                              extractor.merge_size, extractor.order)
+        failure_stage = "native_vision_capture"
         with adapter.capture() as first_capture:
             native_a = forward_once(extractor, inputs)
+        failure_stage = "visual_state_construction"
         state = adapter.make_state(first_capture["output"], inputs["image_grid_thw"],
                                    state_timestamp="same_image", anchor_timestamp="same_image",
-                                   source_audit=audit)
+                                   source_audit=audit, require_spatial_layout=False)
+        failure_stage = "visual_state_diagnostics"
+        state_diagnostics = state.diagnostics()
         audit["runtime_vision_return"] = {
             "observed": True,
             "tensor_tree": tensor_tree_summary(state.vision_output),
-            "final_embedding_path": state.final_path,
-            "deepstack_paths": list(state.deepstack_paths),
-            "all_spatial_paths": list(state.spatial_paths),
+            **state.path_diagnostics(),
         }
         audit["vision_return_structure"].update(
             runtime_observed=True,
@@ -155,16 +163,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         audit["phase"] = "runtime_vision_return_observed"
         atomic_write_json(audit_path, audit)
+        failure_stage = "placeholder_contract_validation"
         placeholder = adapter.validate_placeholder_contract(inputs, state)
+        failure_stage = "native_repeat_forward"
         with adapter.capture():
             native_b = forward_once(extractor, inputs)
         before_actual = adapter.counters["actual_vision_computation_count"]
+        failure_stage = "cached_injected_forward"
         with adapter.replace(state):
             injected = forward_once(extractor, inputs)
+        failure_stage = "native_generation"
         bypass_forward = adapter.counters["actual_vision_computation_count"] == before_actual
         with adapter.capture():
             native_ids = generate_once(extractor, inputs, args.max_new_tokens)
         before_actual = adapter.counters["actual_vision_computation_count"]
+        failure_stage = "cached_injected_generation"
         with adapter.replace(state):
             injected_ids = generate_once(extractor, inputs, args.max_new_tokens)
         bypass_generate = adapter.counters["actual_vision_computation_count"] == before_actual
@@ -208,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
             "same_input_ids_attention_mask_and_grid": True,
             "fresh_query_cache": True,
         }
-        diagnostics = {"interface_audit": audit, "visual_state": state.diagnostics(),
+        diagnostics = {"interface_audit": audit, "visual_state": state_diagnostics,
                        "vision_return_tree": tensor_tree_summary(state.vision_output),
                        "deepstack_complete": (not audit["evidence"]["deepstack_in_source"]
                                               or bool(state.deepstack_paths)),
@@ -233,16 +246,21 @@ def main(argv: list[str] | None = None) -> int:
             print("blocked: same-image cached injection is not numerically equivalent", file=sys.stderr)
             return 2
     except Exception as exc:
+        formatted_traceback = traceback.format_exc()
+        traceback.print_exc(file=sys.stderr)
         audit["status"] = "blocked"
         audit["terminal_error"] = f"{type(exc).__name__}: {exc}"
+        audit["failure_stage"] = failure_stage
         if not audit.get("failure_summary") or audit.get("phase") != "source_contract":
             audit["failure_summary"] = audit.get("failure_summary", []) + [audit["terminal_error"]]
         atomic_write_json(audit_path, audit)
         config.update(status="blocked", error=f"{type(exc).__name__}: {exc}")
+        config["failure_stage"] = failure_stage
         atomic_write_json(output_dir / "config.json", config)
         atomic_write_json(output_dir / "injection_equivalence.json",
-                          {"status": "blocked", "error": config["error"]})
-        print(f"blocked: {exc}", file=sys.stderr)
+                          {"status": "blocked", "error": config["error"],
+                           "failure_stage": failure_stage, "traceback": formatted_traceback})
+        print(f"blocked at {failure_stage}: {exc}", file=sys.stderr)
         return 2
     print(f"injection equivalence passed; wrote {output_dir}")
     return 0

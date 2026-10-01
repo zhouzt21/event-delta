@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import time
 import importlib.util
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from src.event_delta.qwen_injection import (
+    InjectionBlocked,
     QwenVisualInjectionAdapter,
     VisualState,
     audit_qwen_interface,
@@ -58,11 +60,15 @@ class FakeVision:
 def fake_state(output=None) -> VisualState:
     output = output if output is not None else (
         np.ones((4, 3)), [np.full((4, 3), 2), np.full((4, 3), 3)])
-    return VisualState(output, (1, 4, 4), (2, 2), 2, "output[0]",
-                       ("output[0]", "output[1][0]", "output[1][1]"),
-                       ("output[1][0]", "output[1][1]"),
-                       {"output[0]": (2, 2), "output[1][0]": (2, 2), "output[1][1]": (2, 2)},
-                       "float32", "cpu", 1, 0, True)
+    paths = ("output[0]", "output[1][0]", "output[1][1]")
+    return VisualState(
+        vision_output=output, image_grid_thw=(1, 4, 4), spatial_grid_hw=(2, 2), merge_size=2,
+        final_path="output[0]", spatial_tensor_paths=paths,
+        deepstack_paths=("output[1][0]", "output[1][1]"),
+        branch_grid_hw={path: (2, 2) for path in paths}, dtype="float32", device="cpu",
+        state_timestamp=1, anchor_timestamp=0, layout_verified=True,
+        tensor_paths=paths, unresolved_spatial_paths=(),
+    )
 
 
 def test_complete_vision_output_replacement_keeps_deepstack_and_bypasses_compute() -> None:
@@ -78,6 +84,35 @@ def test_complete_vision_output_replacement_keeps_deepstack_and_bypasses_compute
     assert adapter.counters["cached_replacement_count"] == 1
     assert adapter.counters["actual_vision_computation_count"] == 0
     assert vision.forward == vision.actual_forward
+
+
+def test_real_visual_state_diagnostics_serialize_final_and_deepstack_tree(tmp_path) -> None:
+    from src.event_delta.json_io import atomic_write_json
+
+    state = fake_state()
+    paths = state.path_diagnostics()
+    diagnostics = state.diagnostics()
+    assert paths["final_embedding_path"] == "output[0]"
+    assert paths["all_tensor_paths"] == ["output[0]", "output[1][0]", "output[1][1]"]
+    assert paths["deepstack_paths"] == ["output[1][0]", "output[1][1]"]
+    assert paths["propagatable_spatial_paths"] == paths["all_tensor_paths"]
+    assert diagnostics["branch_grid_hw"]["output[1][1]"] == [2, 2]
+    destination = tmp_path / "visual_state.json"
+    atomic_write_json(destination, {"runtime_vision_return": paths, "visual_state": diagnostics})
+    loaded = json.loads(destination.read_text())
+    assert loaded["runtime_vision_return"]["deepstack_paths"] == paths["deepstack_paths"]
+
+
+def test_complete_cached_injection_is_separate_from_spatial_propagation_guard() -> None:
+    vision = FakeVision()
+    adapter = QwenVisualInjectionAdapter(SimpleNamespace(), vision, 2,
+                                         {"status": "confirmed_from_installed_source"})
+    state = replace(fake_state(), layout_verified=False,
+                    unresolved_spatial_paths=("output[1][1]",))
+    with adapter.replace(state):
+        assert vision.forward("pixels") is state.vision_output
+    with pytest.raises(InjectionBlocked, match="complete for cached injection"):
+        state.require_propagation_layout()
 
 
 def test_replacement_restores_after_exception() -> None:
@@ -277,6 +312,26 @@ def test_correctness_probe_writes_source_audit_even_before_runtime(tmp_path) -> 
     assert report["status"] == "blocked"
     assert report["phase"] == "argument_validation"
     assert "image is missing" in report["failure_summary"][0]
+
+
+def test_correctness_probe_records_failure_stage_and_traceback(tmp_path, monkeypatch, capsys) -> None:
+    import tools.probe_qwen_injection as probe
+
+    image = tmp_path / "input.png"
+    image.write_bytes(b"not decoded because initialization fails first")
+
+    def fail_extractor(*_args, **_kwargs):
+        raise RuntimeError("synthetic initialization failure")
+
+    monkeypatch.setattr(probe, "QwenVisionExtractor", fail_extractor)
+    output = tmp_path / "probe"
+    assert probe.main(["--image", str(image), "--output-dir", str(output)]) == 2
+    captured = capsys.readouterr()
+    assert "Traceback (most recent call last)" in captured.err
+    equivalence = json.loads((output / "injection_equivalence.json").read_text())
+    assert equivalence["status"] == "blocked"
+    assert equivalence["failure_stage"] == "model_initialization"
+    assert "synthetic initialization failure" in equivalence["traceback"]
 
 
 def test_read_only_audit_cli_writes_failure_artifact_without_transformers(tmp_path, monkeypatch) -> None:
