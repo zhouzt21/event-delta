@@ -181,6 +181,7 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
                          transformers_version: str | None = None) -> dict[str, Any]:
     """Audit installed source using callable structure, signatures and semantic alternatives."""
     base_model = getattr(model, "model", None)
+    language_model = getattr(base_model, "language_model", None)
     methods: dict[str, Any] = {
         "conditional_generation.forward": getattr(model, "forward", None),
         "conditional_generation.get_image_features": getattr(model, "get_image_features", None),
@@ -188,9 +189,12 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
         "conditional_generation.prepare_inputs_for_generation": getattr(
             model, "prepare_inputs_for_generation", None),
         "base_model.forward": getattr(base_model, "forward", None),
+        "base_model.get_image_features": getattr(base_model, "get_image_features", None),
+        "base_model.get_placeholder_mask": getattr(base_model, "get_placeholder_mask", None),
         "base_model.get_rope_index": next((getattr(base_model, name) for name in
                                             ("get_rope_index", "_get_rope_index")
                                             if base_model is not None and hasattr(base_model, name)), None),
+        "language_model.forward": getattr(language_model, "forward", None),
         "conditional_generation.get_rope_index": next((getattr(model, name) for name in
                                                         ("get_rope_index", "_get_rope_index")
                                                         if hasattr(model, name)), None),
@@ -202,43 +206,69 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
     lower = {name: source.lower() for name, source in sources.items()}
 
     model_forward = lower["conditional_generation.forward"]
-    image_features = lower["conditional_generation.get_image_features"]
-    placeholder = lower["conditional_generation.get_placeholder_mask"]
     prepare = lower["conditional_generation.prepare_inputs_for_generation"]
     base_forward = lower["base_model.forward"]
+    language_forward = lower["language_model.forward"]
     rope_sources = "\n".join((lower["base_model.get_rope_index"],
                                lower["conditional_generation.get_rope_index"], base_forward, model_forward))
     vision_source = lower["vision.forward"]
     combined = "\n".join(lower.values())
 
+    image_helper_key = next((name for name in ("base_model.get_image_features",
+                                                "conditional_generation.get_image_features")
+                             if methods[name] is not None), None)
+    placeholder_helper_key = next((name for name in ("base_model.get_placeholder_mask",
+                                                      "conditional_generation.get_placeholder_mask")
+                                   if methods[name] is not None), None)
+    implementation_forward_key = "base_model.forward" if base_model is not None else \
+        "conditional_generation.forward"
+    implementation_forward = lower[implementation_forward_key]
+    image_features = lower[image_helper_key] if image_helper_key else ""
+    placeholder = lower[placeholder_helper_key] if placeholder_helper_key else ""
+
     model_signature = records["conditional_generation.forward"]["signature"] or ""
     vision_signature = records["vision.forward"]["signature"] or ""
     prepare_signature = records["conditional_generation.prepare_inputs_for_generation"]["signature"] or ""
-    placeholder_signature = records["conditional_generation.get_placeholder_mask"]["signature"] or ""
-    image_signature = records["conditional_generation.get_image_features"]["signature"] or ""
+    placeholder_signature = records[placeholder_helper_key]["signature"] if placeholder_helper_key else ""
+    image_signature = records[image_helper_key]["signature"] if image_helper_key else ""
 
     forward_readable = records["conditional_generation.forward"]["source_available"]
     vision_readable = records["vision.forward"]["source_available"]
     prepare_readable = records["conditional_generation.prepare_inputs_for_generation"]["source_available"]
     vision_pixels = any(name in vision_signature for name in ("pixel_values", "hidden_states"))
     vision_grid = any(name in vision_signature for name in ("grid_thw", "image_grid_thw"))
-    image_helper = methods["conditional_generation.get_image_features"] is not None
-    routes_vision = (image_helper and ("pixel_values" in image_signature or "image_grid_thw" in image_signature)
-                     or "get_image_features" in model_forward
-                     or any(token in model_forward for token in ("self.visual(", "self.vision(")))
-    placeholder_helper = methods["conditional_generation.get_placeholder_mask"] is not None
+    outer_delegates_to_inner = (base_model is None
+                                or any(token in model_forward for token in
+                                       ("self.model(", "self.model.forward(")))
+    image_helper = image_helper_key is not None
+    image_helper_called = ("get_image_features" in implementation_forward
+                           or any(token in implementation_forward for token in
+                                  ("self.visual(", "self.vision(")))
+    routes_vision = (image_helper
+                     and ("pixel_values" in image_signature or "image_grid_thw" in image_signature)
+                     and image_helper_called)
+    placeholder_helper = placeholder_helper_key is not None
     placeholder_contract = (placeholder_helper
                             and "input_ids" in placeholder_signature
                             and any(term in placeholder_signature for term in ("image_features", "inputs_embeds")))
-    placeholder_ops = (any(term in placeholder for term in ("eq(", "==", "image_token_id"))
-                       and any(term in placeholder + model_forward for term in
-                               ("masked_scatter", "scatter", "where")))
-    placeholder_inline = ("image_token_id" in model_forward
-                          and any(term in model_forward for term in ("masked_scatter", "scatter", "where")))
-    placeholder_proven = (placeholder_contract and placeholder_ops) or placeholder_inline
+    placeholder_mask_constructed = any(term in placeholder for term in
+                                       ("eq(", "==", "image_token_id", "image_token_index"))
+    placeholder_called = "get_placeholder_mask" in implementation_forward
+    inputs_embeds_replaced = ("inputs_embeds" in implementation_forward
+                              and any(term in implementation_forward for term in
+                                      ("masked_scatter", ".scatter", "torch.where", "where(")))
+    image_to_placeholder_chain = (image_helper_called and placeholder_called
+                                  and inputs_embeds_replaced)
+    placeholder_inline = ("input_ids" in implementation_forward
+                          and any(term in implementation_forward for term in
+                                  ("image_token_id", "image_token_index"))
+                          and inputs_embeds_replaced)
+    placeholder_proven = ((placeholder_contract and placeholder_mask_constructed
+                           and image_to_placeholder_chain) or placeholder_inline)
     grid_proven = (vision_grid and ("image_grid_thw" in model_signature
                                     or "image_grid_thw" in image_signature
-                                    or "image_grid_thw" in model_forward))
+                                    or "image_grid_thw" in model_forward
+                                    or "image_grid_thw" in base_forward))
     prepare_cache_signature = "past_key_values" in prepare_signature
     prepare_position_signature = "cache_position" in prepare_signature
     prepare_cache_logic = ("past_key_values" in prepare
@@ -249,14 +279,23 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
     rope_proven = (rope_callable_present
                    and any(term in rope_sources for term in ("position_ids", "rope_delta", "mrope")))
     position_ids_proven = "position_ids" in model_signature or "position_ids" in base_forward
-    visual_mask_proven = any(term in placeholder + model_forward + base_forward for term in
+    visual_mask_proven = any(term in placeholder + model_forward + base_forward + language_forward for term in
                              ("visual_pos_masks", "visual_position", "image_mask"))
     deepstack_present = any(term in combined for term in
                             ("deepstack", "deep_stack", "deepstack_visual_embeds"))
+    deepstack_from_vision = any(term in image_features + vision_source for term in
+                                ("deepstack", "deep_stack"))
+    deepstack_through_inner = any(term in implementation_forward for term in
+                                  ("deepstack", "deep_stack"))
+    deepstack_into_language = any(term in language_forward +
+                                  (records["language_model.forward"]["signature"] or "") for term in
+                                  ("deepstack", "deep_stack"))
     deepstack_routed = (not deepstack_present or
-                        (any(term in image_features + vision_source for term in ("deepstack", "deep_stack"))
-                         and any(term in model_forward + base_forward for term in
-                                 ("deepstack", "deep_stack"))))
+                        (deepstack_from_vision and deepstack_through_inner
+                         and deepstack_into_language))
+    inner_vision = next((getattr(base_model, name) for name in ("visual", "vision")
+                         if base_model is not None and hasattr(base_model, name)), None)
+    injection_vision_matches = inner_vision is vision
 
     checks = [
         _check("conditional_generation_forward_source", True, forward_readable,
@@ -273,19 +312,36 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
                [f"vision signature={vision_signature}", f"pixel argument recognized={vision_pixels}",
                 f"grid argument recognized={vision_grid}"], "naming_variant_unresolved",
                "vision parameters did not match supported semantic alternatives"),
+        _check("outer_forward_delegates_to_inner_model", True, outer_delegates_to_inner,
+               [f"inner model class={base_model.__class__.__name__ if base_model is not None else None}",
+                "checked self.model(...) and self.model.forward(...) delegation"],
+               "call_chain_unresolved" if base_model is not None else "interface_missing",
+               "outer conditional-generation forward does not expose a recognized call to self.model"),
         _check("model_routes_pixels_to_vision", True, routes_vision,
-               [f"get_image_features callable={image_helper}",
-                "checked get_image_features call and self.visual/self.vision alternatives"],
-               "interface_missing" if forward_readable else "source_unreadable",
-               "could not prove that the multimodal forward invokes the vision path"),
+               [f"selected helper={image_helper_key}", f"helper callable={image_helper}",
+                f"implementation forward={implementation_forward_key}",
+                f"implementation calls image helper={image_helper_called}"],
+               "not_found_in_inspected_call_chain" if forward_readable else "source_unreadable",
+               "could not prove image feature extraction in the traced outer-to-inner call chain"),
         _check("image_placeholder_replacement", True, placeholder_proven,
-               [f"get_placeholder_mask callable={placeholder_helper}",
+               [f"selected helper={placeholder_helper_key}",
+                f"get_placeholder_mask callable={placeholder_helper}",
                 f"helper signature={placeholder_signature}",
                 f"contract signature recognized={placeholder_contract}",
-                f"mask/scatter operations recognized={placeholder_ops or placeholder_inline}"],
-               "naming_variant_unresolved" if placeholder_helper else "interface_missing",
-               "placeholder helper/inline path exists under an unrecognized contract"
-               if placeholder_helper else "no placeholder replacement helper or inline path found"),
+                f"placeholder mask construction recognized={placeholder_mask_constructed}",
+                f"image features feed placeholder path={image_helper_called and placeholder_called}",
+                f"inputs_embeds replacement recognized={inputs_embeds_replaced}"],
+               "naming_variant_unresolved" if placeholder_helper else
+               "not_found_in_inspected_call_chain",
+               "placeholder helper exists but image-features→mask→inputs_embeds replacement was not proven"
+               if placeholder_helper else
+               "no placeholder helper was found in the inspected outer/inner call chain"),
+        _check("injection_targets_inner_vision_instance", True, injection_vision_matches,
+               [f"discovered vision class={vision.__class__.__name__}",
+                f"inner visual/vision class={inner_vision.__class__.__name__ if inner_vision is not None else None}",
+                f"object identity matches={injection_vision_matches}"],
+               "call_chain_unresolved" if inner_vision is None else "interface_mismatch",
+               "the injection adapter's discovered vision module is not the inner model vision instance"),
         _check("image_grid_thw_route", True, grid_proven,
                [f"model signature={model_signature}", f"image helper signature={image_signature}",
                 f"vision signature={vision_signature}"], "naming_variant_unresolved",
@@ -309,8 +365,10 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
                "naming_variant_unresolved", "visual position mask naming/route was not recognized"),
         _check("deepstack_route_if_present", True, deepstack_routed,
                [f"DeepStack symbols present={deepstack_present}",
-                f"DeepStack routed through vision and language model={deepstack_routed}"],
-               "interface_missing", "DeepStack is declared but its complete route was not proven"),
+                f"vision/get_image_features produces DeepStack={deepstack_from_vision}",
+                f"inner forward carries DeepStack={deepstack_through_inner}",
+                f"language model accepts DeepStack={deepstack_into_language}"],
+               "call_chain_unresolved", "DeepStack is declared but its complete route was not proven"),
         _check("visual_token_order", True,
                order.get("status") == "confirmed_from_installed_source",
                [f"token order status={order.get('status')}",
@@ -323,6 +381,11 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
         "image_grid_thw": grid_proven, "position_ids": position_ids_proven,
         "mrope_or_rope_deltas": rope_proven,
         "generation_prefill_decode_branch": generation_proven,
+        "outer_forward_delegates_to_inner_model": outer_delegates_to_inner,
+        "image_helper_location": image_helper_key,
+        "placeholder_helper_location": placeholder_helper_key,
+        "image_features_to_placeholder_to_inputs_embeds": image_to_placeholder_chain,
+        "injection_vision_identity_matches": injection_vision_matches,
         "deepstack_in_source": deepstack_present,
         "deepstack_route_proven": deepstack_routed,
         "visual_position_mask": visual_mask_proven,
@@ -333,7 +396,16 @@ def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[st
         "transformers_version": transformers_version,
         "actual_classes": {"model": model.__class__.__name__, "vision": vision.__class__.__name__,
                            "processor": processor.__class__.__name__,
-                           "base_model": base_model.__class__.__name__ if base_model is not None else None},
+                           "base_model": base_model.__class__.__name__ if base_model is not None else None,
+                           "language_model": (language_model.__class__.__name__
+                                              if language_model is not None else None)},
+        "call_chain": {
+            "outer": "conditional_generation.forward",
+            "inner": implementation_forward_key,
+            "image_features": image_helper_key,
+            "placeholder_mask": placeholder_helper_key,
+            "language_model": "language_model.forward" if language_model is not None else None,
+        },
         "inspected_methods": records, "checks": checks,
         "failed_required_checks": [item["name"] for item in failed_required],
         "failure_summary": [f"{item['name']}: {item['failure_kind']}: {item['failure_reason']}"

@@ -205,7 +205,7 @@ CUDA_VISIBLE_DEVICES=0 python tools/audit_qwen_source_contract.py \
   --output artifacts/r4a_vlm_probe/source_contract_audit.json
 ```
 
-源码 guard 分项要求：conditional-generation `forward`、实际 vision `forward` 和 generation prepare 源码可读取；vision pixel/grid 参数可识别；multimodal forward 能追踪到 vision；image placeholder mask/replacement 可追踪；`image_grid_thw` 路径可追踪；prefill/decode cache 分支可追踪；position IDs 与 MRoPE/rope-delta 路径可追踪；若发现 DeepStack，必须证明其从 vision 到 language model 的完整路径；visual token ordering 必须已由安装源码确认。`visual_position_mask` 也单独审计，但在存在等价 placeholder/DeepStack 路径时只作为诊断项。每项会区分源码不可读取、命名/路径变体尚未识别和接口确实缺失。
+源码 guard 分项要求：conditional-generation `forward`、实际 vision `forward` 和 generation prepare 源码可读取；外层 `forward` 到内层 multimodal model 的委托可追踪；vision pixel/grid 参数可识别；内层 `get_image_features`、`get_placeholder_mask` 以及 image features→mask→`inputs_embeds` replacement 的调用链可追踪；注入器捕获的 vision 必须是内层实际调用的同一实例；`image_grid_thw` 路径可追踪；prefill/decode cache 分支可追踪；position IDs 与 MRoPE/rope-delta 路径可追踪；若发现 DeepStack，必须证明其从 vision 经内层 model 到 language model 的完整路径；visual token ordering 必须已由安装源码确认。`visual_position_mask` 也单独审计，但在存在等价 placeholder/DeepStack 路径时只作为诊断项。每项会区分源码不可读取、命名/路径变体尚未识别、当前调用链范围内未找到和接口确实不匹配。
 
 先运行同图严格等价性 probe：
 

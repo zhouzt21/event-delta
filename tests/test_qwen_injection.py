@@ -130,12 +130,25 @@ def test_fresh_query_removes_cross_query_cache_and_rope_state() -> None:
     assert fresh["input_ids"] is not inputs["input_ids"]
 
 
-class SourceAuditedModel:
-    config = SimpleNamespace()
+class SourceAuditedVision:
+    def forward(self, pixel_values=None, grid_thw=None):
+        deepstack = grid_thw
+        return pixel_values, deepstack
+
+
+class SourceAuditedLanguageModel:
+    def forward(self, inputs_embeds=None, visual_pos_masks=None, deepstack_visual_embeds=None):
+        return inputs_embeds, visual_pos_masks, deepstack_visual_embeds
+
+
+class SourceAuditedInnerModel:
+    def __init__(self, vision=None) -> None:
+        self.visual = vision or SourceAuditedVision()
+        self.language_model = SourceAuditedLanguageModel()
 
     def get_image_features(self, pixel_values=None, image_grid_thw=None):
-        deepstack_visual_embeds = image_grid_thw
-        return pixel_values, deepstack_visual_embeds
+        image_embeds, deepstack_visual_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return image_embeds, deepstack_visual_embeds
 
     def get_placeholder_mask(self, input_ids=None, inputs_embeds=None, image_features=None):
         image_token_id = 1
@@ -143,40 +156,71 @@ class SourceAuditedModel:
         masked_scatter = inputs_embeds, image_features
         return image_mask, masked_scatter
 
-    def forward(self, pixel_values=None, image_grid_thw=None, position_ids=None,
-                deepstack_visual_embeds=None):
-        image_features = self.get_image_features(pixel_values, image_grid_thw)
-        image_mask = self.get_placeholder_mask(None, image_features=image_features)
-        masked_scatter = image_mask
-        rope_deltas = position_ids
-        return masked_scatter, rope_deltas, deepstack_visual_embeds
+    def forward(self, input_ids=None, inputs_embeds=None, pixel_values=None,
+                image_grid_thw=None, position_ids=None):
+        image_features, deepstack_visual_embeds = self.get_image_features(pixel_values, image_grid_thw)
+        image_mask = self.get_placeholder_mask(input_ids, inputs_embeds, image_features=image_features)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+        visual_pos_masks = image_mask
+        return self.language_model(inputs_embeds=inputs_embeds, visual_pos_masks=visual_pos_masks,
+                                   deepstack_visual_embeds=deepstack_visual_embeds)
+
+    def get_rope_index(self, image_grid_thw=None):
+        position_ids = image_grid_thw
+        mrope = position_ids
+        return mrope
+
+
+class SourceAuditedModel:
+    config = SimpleNamespace()
+
+    def __init__(self, vision=None) -> None:
+        self.model = SourceAuditedInnerModel(vision)
+
+    def forward(self, pixel_values=None, image_grid_thw=None, position_ids=None):
+        return self.model(pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+                          position_ids=position_ids)
 
     def prepare_inputs_for_generation(self, past_key_values=None, cache_position=None,
                                       image_grid_thw=None):
         return past_key_values, cache_position, image_grid_thw
 
-    def get_rope_index(self, image_grid_thw=None):
-        mrope = image_grid_thw
-        return mrope
-
-
-class SourceAuditedVision:
-    def forward(self, pixel_values=None, grid_thw=None):
-        deepstack = grid_thw
-        return pixel_values, deepstack
-
-
 def test_installed_source_contract_audit_records_deepstack_and_generation_logic() -> None:
-    report = audit_qwen_interface(SourceAuditedModel(), SourceAuditedVision(),
+    model = SourceAuditedModel()
+    report = audit_qwen_interface(model, model.model.visual,
                                   SimpleNamespace(), {"status": "confirmed_from_installed_source"},
                                   "4.57.6")
     assert report["status"] == "ready"
     assert report["transformers_version"] == "4.57.6"
     assert report["evidence"]["deepstack_in_source"] is True
     assert report["evidence"]["generation_prefill_decode_branch"] is True
+    assert report["evidence"]["outer_forward_delegates_to_inner_model"] is True
+    assert report["evidence"]["placeholder_helper_location"] == "base_model.get_placeholder_mask"
+    assert report["evidence"]["image_features_to_placeholder_to_inputs_embeds"] is True
+    assert report["actual_classes"]["base_model"] == "SourceAuditedInnerModel"
+    assert report["actual_classes"]["language_model"] == "SourceAuditedLanguageModel"
     assert all("failure_reason" in check for check in report["checks"])
     assert report["inspected_methods"]["vision.forward"]["inspect_getsource_succeeded"]
     assert report["inspected_methods"]["vision.forward"]["sha256"]
+    assert report["inspected_methods"]["base_model.get_placeholder_mask"]["sha256"]
+
+
+def test_outer_forward_delegates_to_inner_placeholder_pipeline() -> None:
+    model = SourceAuditedModel()
+    report = audit_qwen_interface(model, model.model.visual, SimpleNamespace(),
+                                  {"status": "confirmed_from_installed_source"})
+    delegation = next(check for check in report["checks"]
+                      if check["name"] == "outer_forward_delegates_to_inner_model")
+    placeholder = next(check for check in report["checks"]
+                       if check["name"] == "image_placeholder_replacement")
+    assert delegation["passed"] and placeholder["passed"]
+    assert report["call_chain"] == {
+        "outer": "conditional_generation.forward",
+        "inner": "base_model.forward",
+        "image_features": "base_model.get_image_features",
+        "placeholder_mask": "base_model.get_placeholder_mask",
+        "language_model": "language_model.forward",
+    }
 
 
 class UnreadableModel(SourceAuditedModel):
@@ -197,7 +241,8 @@ class RenamedVision:
 
 
 def test_source_contract_distinguishes_unreadable_and_missing_interfaces() -> None:
-    unreadable = audit_qwen_interface(UnreadableModel(), SourceAuditedVision(),
+    unreadable_model = UnreadableModel()
+    unreadable = audit_qwen_interface(unreadable_model, unreadable_model.model.visual,
                                       SimpleNamespace(), {"status": "confirmed_from_installed_source"})
     forward_check = next(check for check in unreadable["checks"]
                          if check["name"] == "conditional_generation_forward_source")
@@ -208,13 +253,14 @@ def test_source_contract_distinguishes_unreadable_and_missing_interfaces() -> No
     route = next(check for check in missing["checks"] if check["name"] == "model_routes_pixels_to_vision")
     placeholder = next(check for check in missing["checks"]
                        if check["name"] == "image_placeholder_replacement")
-    assert route["failure_kind"] == "interface_missing"
-    assert placeholder["failure_kind"] == "interface_missing"
+    assert route["failure_kind"] == "not_found_in_inspected_call_chain"
+    assert placeholder["failure_kind"] == "not_found_in_inspected_call_chain"
     message = contract_failure_message(missing)
     assert "model_routes_pixels_to_vision" in message
     assert "image_placeholder_replacement" in message
 
-    renamed = audit_qwen_interface(SourceAuditedModel(), RenamedVision(),
+    renamed_model = SourceAuditedModel(RenamedVision())
+    renamed = audit_qwen_interface(renamed_model, renamed_model.model.visual,
                                    SimpleNamespace(), {"status": "confirmed_from_installed_source"})
     signature = next(check for check in renamed["checks"]
                      if check["name"] == "vision_pixel_and_grid_signature")
