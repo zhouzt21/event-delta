@@ -244,3 +244,23 @@ CUDA_VISIBLE_DEVICES=0 python tools/run_r4_vlm_efficiency.py \
 正式模式保留 `dense_native`、`dense_cached`、`stale_cached` 与 `event_masked_cached`。Event state 只读取 query time 之前的 Event packet；不读取 target RGB、annotation 或 GT flow。每个可证明空间布局的 visual branch 都使用相应 grid recurrent propagation；splat holes 固定用上一状态同位置 token 填补并记录 validity，绝不用 target RGB/GT feature。每次 query 都执行新的 multimodal prefill，不跨模式复用 LLM KV cache。
 
 correctness probe 无论通过还是 blocked 都写出 `source_contract_audit.json`；其中记录实际类、逐方法源码路径/hash、逐项证据与失败分类，真实 vision 已执行时还记录其完整返回 tensor tree。其余输出为 `config.json`、`environment.json`、`injection_equivalence.json`、`per_run_metrics.csv`、`efficiency.json`、`generations.jsonl`、`visual_state_diagnostics.json` 和 `summary.md`。CPU wall 与 CUDA computation 分开记录；完整 query 分位数来自逐次完整 measurement。报告同时给出 on-demand cost、maintained-state query latency、后台 transition cost，以及实际累计的“10 次 dense RGB vision”对“1 次 anchor vision + 9 次 Event update”。本轮不减少视觉 token，不宣称 LLM prefill/KV 加速、不宣称真实异步实时系统，也不进行正式 downstream accuracy evaluation。
+
+### R4a 单窗口效率诊断
+
+若完整 Event transition 明显超过 100 ms，可在新的输出目录运行单窗口、单 prompt 诊断；它不会覆盖主 benchmark artifact，也不会改变 Event 更新频率或传播方法：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/diagnose_r4_efficiency.py \
+  --root "$SEVD_ROOT" \
+  --recording fixed-3 \
+  --anchor-frame-id 5581 \
+  --eraft-root "$ERAFT_ROOT" \
+  --checkpoint "$ERAFT_CHECKPOINT" \
+  --injection-equivalence artifacts/r4a_vlm_probe/equivalence/injection_equivalence.json \
+  --model Qwen/Qwen3-VL-2B-Instruct \
+  --device cuda \
+  --local-files-only \
+  --output-dir artifacts/r4a_efficiency_diagnostic/run-001
+```
+
+每个 transition 先以一个外层同步边界测量正常完整路径，再单独 replay 并同步拆分 Event 解压、voxel、传输、E-RAFT、flow resize、support、逐视觉分支 grid/splat、holes fallback、tree copy 和状态构造；细分阶段不会相加冒充正常路径总耗时。dense 路径独立拆分图片读取、processor、传输、vision tower 和状态缓存。查询同时保留自然停止与固定 32-token 两组结果，并分别报告 TTFT、decode ms/token 和完整回答延时。输出包括 `transition_timings.csv`、`branch_propagation_timings.csv`、`dense_timings.csv`、`query_timings.csv`、`efficiency_diagnostic.json`、`generations.jsonl` 与 `summary.md`。
