@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import importlib.util
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from src.event_delta.qwen_injection import (
     QwenVisualInjectionAdapter,
     VisualState,
     audit_qwen_interface,
+    contract_failure_message,
     causal_hole_fill,
     fresh_query_inputs,
     injection_passes,
@@ -131,11 +133,23 @@ def test_fresh_query_removes_cross_query_cache_and_rope_state() -> None:
 class SourceAuditedModel:
     config = SimpleNamespace()
 
-    def forward(self, image_grid_thw=None, position_ids=None):
-        image_mask = image_grid_thw
+    def get_image_features(self, pixel_values=None, image_grid_thw=None):
+        deepstack_visual_embeds = image_grid_thw
+        return pixel_values, deepstack_visual_embeds
+
+    def get_placeholder_mask(self, input_ids=None, inputs_embeds=None, image_features=None):
+        image_token_id = 1
+        image_mask = input_ids == image_token_id
+        masked_scatter = inputs_embeds, image_features
+        return image_mask, masked_scatter
+
+    def forward(self, pixel_values=None, image_grid_thw=None, position_ids=None,
+                deepstack_visual_embeds=None):
+        image_features = self.get_image_features(pixel_values, image_grid_thw)
+        image_mask = self.get_placeholder_mask(None, image_features=image_features)
         masked_scatter = image_mask
         rope_deltas = position_ids
-        return masked_scatter, rope_deltas
+        return masked_scatter, rope_deltas, deepstack_visual_embeds
 
     def prepare_inputs_for_generation(self, past_key_values=None, cache_position=None,
                                       image_grid_thw=None):
@@ -154,10 +168,85 @@ class SourceAuditedVision:
 
 def test_installed_source_contract_audit_records_deepstack_and_generation_logic() -> None:
     report = audit_qwen_interface(SourceAuditedModel(), SourceAuditedVision(),
-                                  SimpleNamespace(), {"status": "confirmed_from_installed_source"})
+                                  SimpleNamespace(), {"status": "confirmed_from_installed_source"},
+                                  "4.57.6")
     assert report["status"] == "ready"
+    assert report["transformers_version"] == "4.57.6"
     assert report["evidence"]["deepstack_in_source"] is True
     assert report["evidence"]["generation_prefill_decode_branch"] is True
+    assert all("failure_reason" in check for check in report["checks"])
+    assert report["inspected_methods"]["vision.forward"]["inspect_getsource_succeeded"]
+    assert report["inspected_methods"]["vision.forward"]["sha256"]
+
+
+class UnreadableModel(SourceAuditedModel):
+    forward = len
+
+
+class MissingInterfaceModel:
+    def forward(self, image_grid_thw=None, position_ids=None):
+        return image_grid_thw, position_ids
+
+    def prepare_inputs_for_generation(self, past_key_values=None, cache_position=None):
+        return past_key_values, cache_position
+
+
+class RenamedVision:
+    def forward(self, frames=None, layout=None):
+        return frames, layout
+
+
+def test_source_contract_distinguishes_unreadable_and_missing_interfaces() -> None:
+    unreadable = audit_qwen_interface(UnreadableModel(), SourceAuditedVision(),
+                                      SimpleNamespace(), {"status": "confirmed_from_installed_source"})
+    forward_check = next(check for check in unreadable["checks"]
+                         if check["name"] == "conditional_generation_forward_source")
+    assert not forward_check["passed"] and forward_check["failure_kind"] == "source_unreadable"
+
+    missing = audit_qwen_interface(MissingInterfaceModel(), SourceAuditedVision(),
+                                   SimpleNamespace(), {"status": "confirmed_from_installed_source"})
+    route = next(check for check in missing["checks"] if check["name"] == "model_routes_pixels_to_vision")
+    placeholder = next(check for check in missing["checks"]
+                       if check["name"] == "image_placeholder_replacement")
+    assert route["failure_kind"] == "interface_missing"
+    assert placeholder["failure_kind"] == "interface_missing"
+    message = contract_failure_message(missing)
+    assert "model_routes_pixels_to_vision" in message
+    assert "image_placeholder_replacement" in message
+
+    renamed = audit_qwen_interface(SourceAuditedModel(), RenamedVision(),
+                                   SimpleNamespace(), {"status": "confirmed_from_installed_source"})
+    signature = next(check for check in renamed["checks"]
+                     if check["name"] == "vision_pixel_and_grid_signature")
+    assert signature["failure_kind"] == "naming_variant_unresolved"
+
+
+def test_correctness_probe_writes_source_audit_even_before_runtime(tmp_path) -> None:
+    from tools.probe_qwen_injection import main
+
+    output = tmp_path / "probe"
+    code = main(["--image", str(tmp_path / "missing.png"), "--output-dir", str(output)])
+    assert code == 2
+    report = json.loads((output / "source_contract_audit.json").read_text())
+    assert report["status"] == "blocked"
+    assert report["phase"] == "argument_validation"
+    assert "image is missing" in report["failure_summary"][0]
+
+
+def test_read_only_audit_cli_writes_failure_artifact_without_transformers(tmp_path, monkeypatch) -> None:
+    import tools.audit_qwen_source_contract as audit_cli
+
+    def fail_extractor(*_args, **_kwargs):
+        raise RuntimeError("runtime deliberately unavailable")
+
+    monkeypatch.setattr(audit_cli, "QwenVisionExtractor", fail_extractor)
+    output = tmp_path / "source_contract_audit.json"
+    code = audit_cli.main(["--output", str(output), "--local-files-only"])
+    assert code == 2
+    report = json.loads(output.read_text())
+    assert report["read_only_source_audit"] is True
+    assert report["vision_or_language_forward_executed"] is False
+    assert "runtime deliberately unavailable" in report["terminal_error"]
 
 
 def test_equivalence_failure_blocks() -> None:

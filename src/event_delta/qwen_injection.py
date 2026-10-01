@@ -46,20 +46,38 @@ def fresh_query_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _source(value: Any) -> str:
+    return _source_record(value).pop("source_text")
+
+
+def _safe_signature(value: Any) -> str | None:
     try:
-        return inspect.getsource(value)
-    except (OSError, TypeError):
-        return ""
+        return str(inspect.signature(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _source_record(value: Any) -> dict[str, Any]:
-    source = _source(value)
+    source, source_error = "", None
+    if value is None:
+        source_error = "callable missing"
     try:
-        path = inspect.getsourcefile(value)
-    except TypeError:
+        source = inspect.getsource(value) if value is not None else ""
+    except (OSError, TypeError) as exc:
+        source_error = f"{type(exc).__name__}: {exc}"
+    try:
+        path = inspect.getsourcefile(value) if value is not None else None
+    except TypeError as exc:
         path = None
-    return {"file": path, "sha256": hashlib.sha256(source.encode()).hexdigest(),
-            "line_count": len(source.splitlines()), "source_available": bool(source)}
+        source_error = source_error or f"{type(exc).__name__}: {exc}"
+    owner = getattr(value, "__self__", None)
+    owner_class = owner if inspect.isclass(owner) else getattr(owner, "__class__", None)
+    return {"owner_class": (owner_class.__name__ if owner_class is not None else None),
+            "method": getattr(value, "__name__", None),
+            "qualified_name": getattr(value, "__qualname__", None),
+            "file": path, "sha256": hashlib.sha256(source.encode()).hexdigest() if source else None,
+            "line_count": len(source.splitlines()), "signature": _safe_signature(value),
+            "inspect_getsource_succeeded": bool(source), "source_available": bool(source),
+            "source_error": source_error, "source_text": source}
 
 
 def tree_tensors(value: Any, path: str = "output") -> list[tuple[str, Any]]:
@@ -152,49 +170,191 @@ class VisualState:
         }
 
 
-def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[str, Any]) -> dict[str, Any]:
-    """Audit the installed sources that govern multimodal forward and generation."""
-    forward = _source(model.forward)
-    vision_forward = _source(vision.forward)
-    prepare = _source(getattr(model, "prepare_inputs_for_generation", None))
-    rope_callable = next((getattr(model, name) for name in ("get_rope_index", "_get_rope_index")
-                          if hasattr(model, name)), None)
-    rope = _source(rope_callable)
-    combined = "\n".join((forward, vision_forward, prepare, rope)).lower()
-    report = {
-        "model_forward": _source_record(model.forward),
-        "vision_forward": _source_record(vision.forward),
-        "prepare_inputs_for_generation": _source_record(
-            getattr(model, "prepare_inputs_for_generation", None)),
-        "rope_function": _source_record(rope_callable),
-        "model_forward_signature": str(inspect.signature(model.forward)),
-        "vision_forward_signature": str(inspect.signature(vision.forward)),
-        "generation_prepare_signature": str(inspect.signature(model.prepare_inputs_for_generation)),
-        "evidence": {
-            "image_placeholder_replacement": any(word in forward.lower() for word in
-                                                   ("masked_scatter", "image_mask", "image_token")),
-            "image_grid_thw": "image_grid_thw" in combined,
-            "position_ids": "position_ids" in combined,
-            "mrope_or_rope_deltas": "rope_delta" in combined or "mrope" in combined,
-            "generation_prefill_decode_branch": ("past_key_values" in prepare.lower()
-                                                   and "cache_position" in prepare.lower()),
-            "deepstack_in_source": "deepstack" in combined or "deep_stack" in combined,
-            "visual_position_mask": "visual_pos" in combined or "image_mask" in combined,
-            "token_order_status": order.get("status"),
-        },
-        "processor_class": processor.__class__.__name__,
-        "transformers_site_packages_modified": False,
-        "global_monkey_patch": False,
+def _check(name: str, required: bool, passed: bool, evidence: list[str],
+           failure_kind: str | None, failure_reason: str | None) -> dict[str, Any]:
+    return {"name": name, "required": required, "passed": bool(passed), "evidence": evidence,
+            "failure_kind": None if passed else failure_kind,
+            "failure_reason": None if passed else failure_reason}
+
+
+def audit_qwen_interface(model: Any, vision: Any, processor: Any, order: dict[str, Any],
+                         transformers_version: str | None = None) -> dict[str, Any]:
+    """Audit installed source using callable structure, signatures and semantic alternatives."""
+    base_model = getattr(model, "model", None)
+    methods: dict[str, Any] = {
+        "conditional_generation.forward": getattr(model, "forward", None),
+        "conditional_generation.get_image_features": getattr(model, "get_image_features", None),
+        "conditional_generation.get_placeholder_mask": getattr(model, "get_placeholder_mask", None),
+        "conditional_generation.prepare_inputs_for_generation": getattr(
+            model, "prepare_inputs_for_generation", None),
+        "base_model.forward": getattr(base_model, "forward", None),
+        "base_model.get_rope_index": next((getattr(base_model, name) for name in
+                                            ("get_rope_index", "_get_rope_index")
+                                            if base_model is not None and hasattr(base_model, name)), None),
+        "conditional_generation.get_rope_index": next((getattr(model, name) for name in
+                                                        ("get_rope_index", "_get_rope_index")
+                                                        if hasattr(model, name)), None),
+        "vision.forward": getattr(vision, "forward", None),
+        "processor.apply_chat_template": getattr(processor, "apply_chat_template", None),
     }
-    required = (report["model_forward"]["source_available"], report["vision_forward"]["source_available"],
-                report["prepare_inputs_for_generation"]["source_available"],
-                report["evidence"]["image_placeholder_replacement"], report["evidence"]["image_grid_thw"],
-                report["evidence"]["generation_prefill_decode_branch"],
-                order.get("status") == "confirmed_from_installed_source")
-    report["status"] = "ready" if all(required) else "blocked"
-    if report["status"] == "blocked":
-        report["warning"] = "installed source does not prove the full visual injection contract"
-    return report
+    records = {name: _source_record(value) for name, value in methods.items()}
+    sources = {name: record.pop("source_text") for name, record in records.items()}
+    lower = {name: source.lower() for name, source in sources.items()}
+
+    model_forward = lower["conditional_generation.forward"]
+    image_features = lower["conditional_generation.get_image_features"]
+    placeholder = lower["conditional_generation.get_placeholder_mask"]
+    prepare = lower["conditional_generation.prepare_inputs_for_generation"]
+    base_forward = lower["base_model.forward"]
+    rope_sources = "\n".join((lower["base_model.get_rope_index"],
+                               lower["conditional_generation.get_rope_index"], base_forward, model_forward))
+    vision_source = lower["vision.forward"]
+    combined = "\n".join(lower.values())
+
+    model_signature = records["conditional_generation.forward"]["signature"] or ""
+    vision_signature = records["vision.forward"]["signature"] or ""
+    prepare_signature = records["conditional_generation.prepare_inputs_for_generation"]["signature"] or ""
+    placeholder_signature = records["conditional_generation.get_placeholder_mask"]["signature"] or ""
+    image_signature = records["conditional_generation.get_image_features"]["signature"] or ""
+
+    forward_readable = records["conditional_generation.forward"]["source_available"]
+    vision_readable = records["vision.forward"]["source_available"]
+    prepare_readable = records["conditional_generation.prepare_inputs_for_generation"]["source_available"]
+    vision_pixels = any(name in vision_signature for name in ("pixel_values", "hidden_states"))
+    vision_grid = any(name in vision_signature for name in ("grid_thw", "image_grid_thw"))
+    image_helper = methods["conditional_generation.get_image_features"] is not None
+    routes_vision = (image_helper and ("pixel_values" in image_signature or "image_grid_thw" in image_signature)
+                     or "get_image_features" in model_forward
+                     or any(token in model_forward for token in ("self.visual(", "self.vision(")))
+    placeholder_helper = methods["conditional_generation.get_placeholder_mask"] is not None
+    placeholder_contract = (placeholder_helper
+                            and "input_ids" in placeholder_signature
+                            and any(term in placeholder_signature for term in ("image_features", "inputs_embeds")))
+    placeholder_ops = (any(term in placeholder for term in ("eq(", "==", "image_token_id"))
+                       and any(term in placeholder + model_forward for term in
+                               ("masked_scatter", "scatter", "where")))
+    placeholder_inline = ("image_token_id" in model_forward
+                          and any(term in model_forward for term in ("masked_scatter", "scatter", "where")))
+    placeholder_proven = (placeholder_contract and placeholder_ops) or placeholder_inline
+    grid_proven = (vision_grid and ("image_grid_thw" in model_signature
+                                    or "image_grid_thw" in image_signature
+                                    or "image_grid_thw" in model_forward))
+    prepare_cache_signature = "past_key_values" in prepare_signature
+    prepare_position_signature = "cache_position" in prepare_signature
+    prepare_cache_logic = ("past_key_values" in prepare
+                           and any(term in prepare for term in ("cache_position", "input_ids", "pixel_values")))
+    generation_proven = prepare_cache_signature and (prepare_position_signature or prepare_cache_logic)
+    rope_callable_present = (methods["base_model.get_rope_index"] is not None
+                             or methods["conditional_generation.get_rope_index"] is not None)
+    rope_proven = (rope_callable_present
+                   and any(term in rope_sources for term in ("position_ids", "rope_delta", "mrope")))
+    position_ids_proven = "position_ids" in model_signature or "position_ids" in base_forward
+    visual_mask_proven = any(term in placeholder + model_forward + base_forward for term in
+                             ("visual_pos_masks", "visual_position", "image_mask"))
+    deepstack_present = any(term in combined for term in
+                            ("deepstack", "deep_stack", "deepstack_visual_embeds"))
+    deepstack_routed = (not deepstack_present or
+                        (any(term in image_features + vision_source for term in ("deepstack", "deep_stack"))
+                         and any(term in model_forward + base_forward for term in
+                                 ("deepstack", "deep_stack"))))
+
+    checks = [
+        _check("conditional_generation_forward_source", True, forward_readable,
+               ["inspect.getsource(Qwen conditional-generation forward)"], "source_unreadable",
+               records["conditional_generation.forward"]["source_error"] or "source unavailable"),
+        _check("vision_forward_source", True, vision_readable,
+               ["inspect.getsource(actual vision forward)"], "source_unreadable",
+               records["vision.forward"]["source_error"] or "source unavailable"),
+        _check("generation_prepare_source", True, prepare_readable,
+               ["inspect.getsource(prepare_inputs_for_generation)"], "source_unreadable",
+               records["conditional_generation.prepare_inputs_for_generation"]["source_error"]
+               or "source unavailable"),
+        _check("vision_pixel_and_grid_signature", True, vision_pixels and vision_grid,
+               [f"vision signature={vision_signature}", f"pixel argument recognized={vision_pixels}",
+                f"grid argument recognized={vision_grid}"], "naming_variant_unresolved",
+               "vision parameters did not match supported semantic alternatives"),
+        _check("model_routes_pixels_to_vision", True, routes_vision,
+               [f"get_image_features callable={image_helper}",
+                "checked get_image_features call and self.visual/self.vision alternatives"],
+               "interface_missing" if forward_readable else "source_unreadable",
+               "could not prove that the multimodal forward invokes the vision path"),
+        _check("image_placeholder_replacement", True, placeholder_proven,
+               [f"get_placeholder_mask callable={placeholder_helper}",
+                f"helper signature={placeholder_signature}",
+                f"contract signature recognized={placeholder_contract}",
+                f"mask/scatter operations recognized={placeholder_ops or placeholder_inline}"],
+               "naming_variant_unresolved" if placeholder_helper else "interface_missing",
+               "placeholder helper/inline path exists under an unrecognized contract"
+               if placeholder_helper else "no placeholder replacement helper or inline path found"),
+        _check("image_grid_thw_route", True, grid_proven,
+               [f"model signature={model_signature}", f"image helper signature={image_signature}",
+                f"vision signature={vision_signature}"], "naming_variant_unresolved",
+               "could not trace image_grid_thw (or grid_thw at vision boundary) through signatures/source"),
+        _check("generation_prefill_decode_contract", True, generation_proven,
+               [f"prepare signature={prepare_signature}",
+                f"past_key_values signature={prepare_cache_signature}",
+                f"cache_position signature={prepare_position_signature}",
+                f"cache branching logic recognized={prepare_cache_logic}"],
+               "naming_variant_unresolved" if methods[
+                   "conditional_generation.prepare_inputs_for_generation"] is not None else "interface_missing",
+               "generation prepare method exists but prefill/decode cache contract was not recognized"),
+        _check("position_ids_and_mrope_contract", True, position_ids_proven and rope_proven,
+               [f"position_ids recognized={position_ids_proven}",
+                f"rope callable present={rope_callable_present}", f"MRoPE/rope evidence={rope_proven}"],
+               "naming_variant_unresolved" if rope_callable_present else "interface_missing",
+               "position/MRoPE implementation exists under an unrecognized path"
+               if rope_callable_present else "no get_rope_index variant found"),
+        _check("visual_position_mask_contract", False, visual_mask_proven,
+               ["checked get_placeholder_mask, conditional forward, and base-model forward"],
+               "naming_variant_unresolved", "visual position mask naming/route was not recognized"),
+        _check("deepstack_route_if_present", True, deepstack_routed,
+               [f"DeepStack symbols present={deepstack_present}",
+                f"DeepStack routed through vision and language model={deepstack_routed}"],
+               "interface_missing", "DeepStack is declared but its complete route was not proven"),
+        _check("visual_token_order", True,
+               order.get("status") == "confirmed_from_installed_source",
+               [f"token order status={order.get('status')}",
+                f"warning={order.get('warning')}"], "naming_variant_unresolved",
+               order.get("warning") or "visual token order is unresolved"),
+    ]
+    failed_required = [item for item in checks if item["required"] and not item["passed"]]
+    evidence = {
+        "image_placeholder_replacement": placeholder_proven,
+        "image_grid_thw": grid_proven, "position_ids": position_ids_proven,
+        "mrope_or_rope_deltas": rope_proven,
+        "generation_prefill_decode_branch": generation_proven,
+        "deepstack_in_source": deepstack_present,
+        "deepstack_route_proven": deepstack_routed,
+        "visual_position_mask": visual_mask_proven,
+        "token_order_status": order.get("status"),
+    }
+    return {
+        "status": "ready" if not failed_required else "blocked",
+        "transformers_version": transformers_version,
+        "actual_classes": {"model": model.__class__.__name__, "vision": vision.__class__.__name__,
+                           "processor": processor.__class__.__name__,
+                           "base_model": base_model.__class__.__name__ if base_model is not None else None},
+        "inspected_methods": records, "checks": checks,
+        "failed_required_checks": [item["name"] for item in failed_required],
+        "failure_summary": [f"{item['name']}: {item['failure_kind']}: {item['failure_reason']}"
+                            for item in failed_required],
+        "evidence": evidence,
+        "vision_return_structure": {
+            "runtime_observed": False,
+            "forward_signature": vision_signature,
+            "return_statements_in_source": vision_source.count("return "),
+            "deepstack_symbols_in_source": deepstack_present,
+            "note": "Source evidence only; the full probe replaces this with the observed tensor tree.",
+        },
+        "runtime_vision_return": {"observed": False,
+                                  "reason": "source-only phase; populated after native vision execution"},
+        "transformers_site_packages_modified": False, "global_monkey_patch": False,
+    }
+
+
+def contract_failure_message(report: dict[str, Any]) -> str:
+    failures = report.get("failure_summary", [])
+    return "source contract failed: " + ("; ".join(failures) if failures else "unknown check")
 
 
 class QwenVisualInjectionAdapter:

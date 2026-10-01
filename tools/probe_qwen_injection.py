@@ -17,12 +17,13 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from event_delta.json_io import atomic_write_json, atomic_write_jsonl  # noqa: E402
-from event_delta.qwen_features import ProbeError, QwenVisionExtractor  # noqa: E402
+from event_delta.qwen_features import QwenVisionExtractor  # noqa: E402
 from event_delta.qwen_injection import (  # noqa: E402
     InjectionBlocked,
     QwenVisualInjectionAdapter,
     audit_qwen_interface,
     compare_logits,
+    contract_failure_message,
     fresh_query_inputs,
     injection_passes,
     tensor_tree_summary,
@@ -94,21 +95,44 @@ def main(argv: list[str] | None = None) -> int:
                             "automatic_relaxation": False},
               "serial_only": True, "status": "starting"}
     atomic_write_json(output_dir / "config.json", config)
+    audit_path = output_dir / "source_contract_audit.json"
+    audit: dict[str, Any] = {
+        "status": "blocked", "phase": "startup", "transformers_version": None,
+        "actual_classes": {}, "inspected_methods": {}, "checks": [],
+        "failed_required_checks": ["runtime_initialization"],
+        "failure_summary": ["runtime_initialization: audit has not started"],
+        "evidence": {},
+        "vision_return_structure": {"runtime_observed": False, "reason": "runtime has not started"},
+        "runtime_vision_return": {"observed": False, "reason": "runtime has not started"},
+        "transformers_site_packages_modified": False, "global_monkey_patch": False,
+    }
+    atomic_write_json(audit_path, audit)
     if not args.image.is_file() or args.max_new_tokens <= 0:
+        audit.update(phase="argument_validation",
+                     failure_summary=["argument_validation: image is missing or max-new-tokens is invalid"])
+        atomic_write_json(audit_path, audit)
         print("error: image is missing or max-new-tokens is invalid", file=sys.stderr)
         return 2
     try:
         extractor = QwenVisionExtractor(args.model, args.local_files_only, args.device)
         torch = extractor.torch
+        audit.update(transformers_version=extractor.transformers.__version__, phase="version_validation",
+                     actual_classes={"model": extractor.model.__class__.__name__,
+                                     "vision": extractor.structure["vision"].__class__.__name__,
+                                     "processor": extractor.processor.__class__.__name__})
+        atomic_write_json(audit_path, audit)
         if extractor.transformers.__version__ != args.expected_transformers_version:
             raise InjectionBlocked(f"Transformers version mismatch: expected "
                                    f"{args.expected_transformers_version}, got "
                                    f"{extractor.transformers.__version__}")
-        inputs = prepare_inputs(extractor, args.image.resolve(), args.prompt)
         audit = audit_qwen_interface(extractor.model, extractor.structure["vision"],
-                                     extractor.processor, extractor.order)
+                                     extractor.processor, extractor.order,
+                                     extractor.transformers.__version__)
+        audit["phase"] = "source_contract"
+        atomic_write_json(audit_path, audit)
         if audit["status"] != "ready":
-            raise InjectionBlocked(audit["warning"])
+            raise InjectionBlocked(contract_failure_message(audit))
+        inputs = prepare_inputs(extractor, args.image.resolve(), args.prompt)
         adapter = QwenVisualInjectionAdapter(extractor.model, extractor.structure["vision"],
                                              extractor.merge_size, extractor.order)
         with adapter.capture() as first_capture:
@@ -116,6 +140,21 @@ def main(argv: list[str] | None = None) -> int:
         state = adapter.make_state(first_capture["output"], inputs["image_grid_thw"],
                                    state_timestamp="same_image", anchor_timestamp="same_image",
                                    source_audit=audit)
+        audit["runtime_vision_return"] = {
+            "observed": True,
+            "tensor_tree": tensor_tree_summary(state.vision_output),
+            "final_embedding_path": state.final_path,
+            "deepstack_paths": list(state.deepstack_paths),
+            "all_spatial_paths": list(state.spatial_paths),
+        }
+        audit["vision_return_structure"].update(
+            runtime_observed=True,
+            final_embedding_path=state.final_path,
+            deepstack_paths=list(state.deepstack_paths),
+            tensor_tree=tensor_tree_summary(state.vision_output),
+        )
+        audit["phase"] = "runtime_vision_return_observed"
+        atomic_write_json(audit_path, audit)
         placeholder = adapter.validate_placeholder_contract(inputs, state)
         with adapter.capture():
             native_b = forward_once(extractor, inputs)
@@ -193,7 +232,12 @@ def main(argv: list[str] | None = None) -> int:
         if not passed:
             print("blocked: same-image cached injection is not numerically equivalent", file=sys.stderr)
             return 2
-    except (ProbeError, InjectionBlocked, OSError, RuntimeError, ValueError, KeyError) as exc:
+    except Exception as exc:
+        audit["status"] = "blocked"
+        audit["terminal_error"] = f"{type(exc).__name__}: {exc}"
+        if not audit.get("failure_summary") or audit.get("phase") != "source_contract":
+            audit["failure_summary"] = audit.get("failure_summary", []) + [audit["terminal_error"]]
+        atomic_write_json(audit_path, audit)
         config.update(status="blocked", error=f"{type(exc).__name__}: {exc}")
         atomic_write_json(output_dir / "config.json", config)
         atomic_write_json(output_dir / "injection_equivalence.json",

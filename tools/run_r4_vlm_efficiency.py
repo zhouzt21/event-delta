@@ -23,7 +23,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from event_delta.json_io import atomic_write_json, atomic_write_jsonl  # noqa: E402
 from event_delta.qwen_features import ProbeError, QwenVisionExtractor  # noqa: E402
 from event_delta.qwen_injection import (  # noqa: E402
-    InjectionBlocked, QwenVisualInjectionAdapter, audit_qwen_interface,
+    InjectionBlocked, QwenVisualInjectionAdapter, audit_qwen_interface, contract_failure_message,
     fresh_query_inputs, propagate_visual_state,
 )
 from event_delta.r3_propagation import event_support_mask  # noqa: E402
@@ -346,9 +346,10 @@ def main(argv: list[str] | None = None) -> int:
         if any(frame not in rgb or frame not in events for frame in required_ids):
             raise FileNotFoundError("R4a anchor window lacks RGB or Event frames")
         audit = audit_qwen_interface(extractor.model, extractor.structure["vision"],
-                                     extractor.processor, extractor.order)
+                                     extractor.processor, extractor.order,
+                                     extractor.transformers.__version__)
         if audit["status"] != "ready":
-            raise InjectionBlocked(audit.get("warning", "installed interface audit blocked"))
+            raise InjectionBlocked(contract_failure_message(audit))
         adapter = QwenVisualInjectionAdapter(extractor.model, extractor.structure["vision"],
                                              extractor.merge_size, extractor.order)
         event_states, maintenance, anchor_timings = {}, [], []
