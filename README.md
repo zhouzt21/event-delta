@@ -189,3 +189,45 @@ python tools/audit_r3_statistics.py \
 审计输出包含稳定的 `aggregate_metrics.csv`（overall、recording overall、offset、activity；window-macro 与 token-weighted micro）、`observation_ratio_diagnostics.csv`、complete-window paired `bootstrap.json`、新 `decision.json`、无小分母 spike 的 `oracle_gap_closed.png` 和 `summary.md`。bootstrap 始终以完整 window 连同全部 offsets 为重采样单位；6-window smoke 的区间明确标为 exploratory，不作为硬门槛。
 
 修正后的 gate 不使用 mean-of-ratios，也不要求 stable reference ratio 小于或等于 1。它要求两条 recording 的 raw motion recovery 均为正、offset 3/5/9 的 raw recovery 至少两个为正、masked all-valid aggregate recovery 为正，并保留 coverage 与完整 delta latency 检查；raw all-valid 为负时单独写出 background-drift warning。
+
+## R4a：Qwen VLM visual-state injection 与效率 probe
+
+R4a 首先验证完整 Qwen multimodal forward/generation 的视觉输出缓存注入，不改变 R2/R3 实验定义。适配器以服务器安装的 Transformers 源码和实际 vision 返回树为准，完整保留 final embeddings 与所有 DeepStack/intermediate 分支；它只在串行 context 内局部替换 vision module 的 `forward`，并在 `finally` 恢复，不修改 site-packages、不做全局 monkey patch。若源码、placeholder、MRoPE/generation 路径或任一视觉分支的二维布局无法证明，probe 固定输出 `blocked`。
+
+先运行同图严格等价性 probe：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/probe_qwen_injection.py \
+  --model Qwen/Qwen3-VL-2B-Instruct \
+  --image "$SEVD_ROOT/extracted/fixed-3-archive/rgb_camera/5581.png" \
+  --prompt "Describe the current traffic scene in one sentence." \
+  --device cuda \
+  --local-files-only \
+  --max-new-tokens 32 \
+  --output-dir artifacts/r4a_vlm_probe/equivalence
+```
+
+它比较 native 重复运行与 cached injection 的全 prefill logits、最后 prompt token logits、next-token argmax 和 greedy token IDs，并验证 forward/generate 中 vision computation 确实为零。容差固定写入 config，不会失败后自动放宽。DeepStack 若存在但未完整捕获，或同图等价性不通过，禁止继续 Event benchmark。
+
+等价性通过后运行固定 fixed-3/anchor=5581、offsets 1/5/9、三个短 prompt 的效率 probe：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/run_r4_vlm_efficiency.py \
+  --root "$SEVD_ROOT" \
+  --recording fixed-3 \
+  --anchor-frame-id 5581 \
+  --eraft-root "$ERAFT_ROOT" \
+  --checkpoint "$ERAFT_CHECKPOINT" \
+  --injection-equivalence artifacts/r4a_vlm_probe/equivalence/injection_equivalence.json \
+  --model Qwen/Qwen3-VL-2B-Instruct \
+  --device cuda \
+  --local-files-only \
+  --warmup 3 \
+  --repeats 20 \
+  --max-new-tokens 32 \
+  --output-dir artifacts/r4a_vlm_probe/benchmark
+```
+
+正式模式保留 `dense_native`、`dense_cached`、`stale_cached` 与 `event_masked_cached`。Event state 只读取 query time 之前的 Event packet；不读取 target RGB、annotation 或 GT flow。每个可证明空间布局的 visual branch 都使用相应 grid recurrent propagation；splat holes 固定用上一状态同位置 token 填补并记录 validity，绝不用 target RGB/GT feature。每次 query 都执行新的 multimodal prefill，不跨模式复用 LLM KV cache。
+
+输出为 `config.json`、`environment.json`、`injection_equivalence.json`、`per_run_metrics.csv`、`efficiency.json`、`generations.jsonl`、`visual_state_diagnostics.json` 和 `summary.md`。CPU wall 与 CUDA computation 分开记录；完整 query 分位数来自逐次完整 measurement。报告同时给出 on-demand cost、maintained-state query latency、后台 transition cost，以及实际累计的“10 次 dense RGB vision”对“1 次 anchor vision + 9 次 Event update”。本轮不减少视觉 token，不宣称 LLM prefill/KV 加速、不宣称真实异步实时系统，也不进行正式 downstream accuracy evaluation。
